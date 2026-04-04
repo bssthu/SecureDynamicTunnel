@@ -16,7 +16,7 @@ def generate_token(role):
 def verify_token(role, received_token):
     """校验 Token，允许 1 分钟内的误差以防时钟偏移"""
     t_now = int(time.time() / 60)
-    for t in [t_now, t_now - 1]:
+    for t in [t_now - 1, t_now, t_now + 1]:
         expected = hmac.new(SHARED_KEY.encode(), role.encode() + b"@" + str(t).encode(), hashlib.sha256).digest()
         if hmac.compare_digest(expected, received_token):
             return True
