@@ -3,18 +3,31 @@
 import socket
 import threading
 from secret_tool import verify_token
+from framing import FramedConn, run_bridge, safe_close_sock
 
 LISTEN_PORT = 9001
 
-def bridge(s1, s2):
-    try:
-        while True:
-            data = s1.recv(8192)
-            if not data: break
-            s2.sendall(data)
-    except: pass
-    finally:
-        s1.close(); s2.close()
+
+def _recv_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("对端在握手阶段关闭")
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _start_bridge(framed_a, framed_c):
+    """在独立线程中跑 run_bridge，避免阻塞主 accept 循环。"""
+    def _run():
+        try:
+            run_bridge(framed_a, framed_c)
+        finally:
+            print("[***] A-C 隧道已关闭")
+    threading.Thread(target=_run, daemon=True).start()
+    print("[***] A-C 隧道建立成功！")
+
 
 def main():
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -23,39 +36,54 @@ def main():
     server.listen(20)
     print(f"[*] 中转机器 B 已启动，监听端口 {LISTEN_PORT}...")
 
-    # 用于存放等待配对的连接
-    waiting_conns = {"ROLE_A": None, "ROLE_C": None}
+    # 用于存放等待配对的 FramedConn（已通过认证）
+    waiting = {"ROLE_A": None, "ROLE_C": None}
+    waiting_lock = threading.Lock()
 
-    while True:
-        conn, addr = server.accept()
-        try:
-            # 协议：前 8 字节角色名，后 32 字节 HMAC
-            role = conn.recv(8).decode().strip()
-            token = conn.recv(32)
+    try:
+        while True:
+            conn, addr = server.accept()
+            try:
+                # 握手仍是裸字节：前 8 字节角色名 + 32 字节 HMAC
+                role = _recv_exact(conn, 8).decode(errors="ignore").strip()
+                token = _recv_exact(conn, 32)
 
-            if not verify_token(role, token):
-                print(f"[!] 拒绝非法连接: {addr}")
-                conn.close()
-                continue
+                if role not in ("ROLE_A", "ROLE_C") or not verify_token(role, token):
+                    print(f"[!] 拒绝非法连接: {addr} role={role!r}")
+                    safe_close_sock(conn)
+                    continue
 
-            print(f"[+] {role} 认证成功: {addr}")
-            waiting_conns[role] = conn
+                print(f"[+] {role} 认证成功: {addr}")
+                framed = FramedConn(conn, name=f"B<->{role}")
 
-            # 只有当 A 和 C 同时在线时，打通隧道
-            if waiting_conns["ROLE_A"] and waiting_conns["ROLE_C"]:
-                a_side = waiting_conns["ROLE_A"]
-                c_side = waiting_conns["ROLE_C"]
-                
-                threading.Thread(target=bridge, args=(a_side, c_side), daemon=True).start()
-                threading.Thread(target=bridge, args=(c_side, a_side), daemon=True).start()
-                
-                # 重置等待列表
-                waiting_conns["ROLE_A"] = waiting_conns["ROLE_C"] = None
-                print("[***] A-C 隧道建立成功！")
-                
-        except Exception as e:
-            print(f"[!] 处理连接时出错: {e}")
-            conn.close()
+                pair = None
+                with waiting_lock:
+                    # 同角色重连：把旧的等待连接关掉
+                    old = waiting[role]
+                    if old is not None:
+                        print(f"[!] {role} 已存在等待连接，关闭旧连接")
+                        old.close()
+                    waiting[role] = framed
+
+                    if waiting["ROLE_A"] and waiting["ROLE_C"]:
+                        pair = (waiting["ROLE_A"], waiting["ROLE_C"])
+                        waiting["ROLE_A"] = waiting["ROLE_C"] = None
+
+                if pair is not None:
+                    _start_bridge(pair[0], pair[1])
+
+            except Exception as e:
+                print(f"[!] 处理连接时出错: {e}")
+                safe_close_sock(conn)
+    except KeyboardInterrupt:
+        print("\n[*] 收到退出信号，关闭服务...")
+    finally:
+        with waiting_lock:
+            for f in waiting.values():
+                if f is not None:
+                    f.close()
+        safe_close_sock(server)
+
 
 if __name__ == "__main__":
     main()
