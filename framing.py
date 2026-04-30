@@ -118,6 +118,71 @@ def _heartbeat_loop(conn, stop_event):
             return
 
 
+def waiting_keepalive(framed, promote_event, label=""):
+    """
+    在"已认证但尚未配对"阶段维持一条链路：
+        - 周期发送 PING
+        - 读取并处理 PING/PONG/CLOSE，更新 last_recv
+        - HEARTBEAT_TIMEOUT 内未收到任何帧 → 判死
+        - 收到 DATA 帧视为协议违例（等待期不应有业务数据）
+
+    返回值：
+        True  - 被 promote_event 通知接管（配对成功）
+        False - 链路已死（已被本函数关闭）
+    """
+    framed.sock.settimeout(RECV_POLL)
+    last_ping = time.time()
+    while not promote_event.is_set():
+        try:
+            ftype, _ = framed.recv_frame()
+            if ftype == FRAME_PING:
+                try:
+                    framed.send(FRAME_PONG)
+                except Exception:
+                    framed.close()
+                    return False
+            elif ftype == FRAME_PONG:
+                pass
+            elif ftype == FRAME_CLOSE:
+                print(f"[{label}] 等待期收到 CLOSE")
+                framed.close()
+                return False
+            else:
+                print(f"[{label}] 等待期收到非法帧类型: {ftype}")
+                framed.close()
+                return False
+        except socket.timeout:
+            pass
+        except FrameError as e:
+            print(f"[{label}] 等待期帧错误: {e}")
+            framed.close()
+            return False
+        except Exception as e:
+            print(f"[{label}] 等待期 recv 异常: {e}")
+            framed.close()
+            return False
+
+        now = time.time()
+        if now - last_ping >= HEARTBEAT_INTERVAL:
+            try:
+                framed.send(FRAME_PING)
+                last_ping = now
+            except Exception:
+                framed.close()
+                return False
+        if now - framed.last_recv > HEARTBEAT_TIMEOUT:
+            print(f"[{label}] 等待期心跳超时")
+            framed.close()
+            return False
+
+    # 被提升为正式配对：清掉 timeout，让上层重新设置
+    try:
+        framed.sock.settimeout(None)
+    except Exception:
+        pass
+    return True
+
+
 def run_endpoint(framed, raw_sock, role_label=""):
     """
     A / C 端的双向转发循环：

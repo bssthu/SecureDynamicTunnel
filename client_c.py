@@ -15,14 +15,16 @@ LOCAL_LISTEN_PORT = 8080     # 在 C 机器访问 BIND_IP:LOCAL_LISTEN_PORT
 
 # 断线重连配置
 CONNECT_TIMEOUT = 5          # 单次连接 B 的超时(秒)
-RECONNECT_MAX_RETRIES = 5    # 最大重试次数，超过则放弃并断开本地连接
+RECONNECT_MAX_RETRIES = 0    # 0 = 无限重连；>0 时连续失败超过该次数即放弃并断开本地连接
 RECONNECT_INTERVAL = 2       # 每次重试间隔(秒)
 
 
 def connect_to_b():
     """尝试连接并认证到 B。失败按配置重试，全部失败返回 None。"""
     last_err = None
-    for attempt in range(1, RECONNECT_MAX_RETRIES + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         b_sock = None
         try:
             b_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -38,12 +40,14 @@ def connect_to_b():
         except Exception as e:
             last_err = e
             safe_close_sock(b_sock)
-            print(f"[!] 第 {attempt}/{RECONNECT_MAX_RETRIES} 次连接 B 失败: {e}")
-            if attempt < RECONNECT_MAX_RETRIES:
-                time.sleep(RECONNECT_INTERVAL)
-
-    print(f"[x] 已达到最大重试次数，放弃连接 B (最后错误: {last_err})")
-    return None
+            if RECONNECT_MAX_RETRIES:
+                print(f"[!] 第 {attempt}/{RECONNECT_MAX_RETRIES} 次连接 B 失败: {e}")
+                if attempt >= RECONNECT_MAX_RETRIES:
+                    print(f"[x] 已达到最大重试次数，放弃连接 B (最后错误: {last_err})")
+                    return None
+            else:
+                print(f"[!] 第 {attempt} 次连接 B 失败: {e}，{RECONNECT_INTERVAL}s 后重试")
+            time.sleep(RECONNECT_INTERVAL)
 
 
 def bridge_handler(c_user_conn):

@@ -3,7 +3,10 @@
 import socket
 import threading
 from secret_tool import verify_token
-from framing import FramedConn, run_bridge, safe_close_sock
+from framing import (
+    FramedConn, run_bridge, safe_close_sock, waiting_keepalive,
+    FRAME_CLOSE,
+)
 
 LISTEN_PORT = 9001
 
@@ -36,15 +39,92 @@ def main():
     server.listen(20)
     print(f"[*] 中转机器 B 已启动，监听端口 {LISTEN_PORT}...")
 
-    # 用于存放等待配对的 FramedConn（已通过认证）
-    waiting = {"ROLE_A": None, "ROLE_C": None}
+    # 仅 A 会进入挂机等待状态：(framed, promote_event, keeper_thread)
+    waiting_a = {"framed": None, "event": None, "thread": None}
     waiting_lock = threading.Lock()
+
+    def _release_waiting_a_locked(reason=""):
+        """调用方必须持有 waiting_lock。仅清空记录、关闭旧链路；不 join。"""
+        old = waiting_a["framed"]
+        ev = waiting_a["event"]
+        if old is not None:
+            if reason:
+                print(f"[!] 释放等待中的 A: {reason}")
+            try:
+                old.close()
+            except Exception:
+                pass
+        if ev is not None:
+            ev.set()
+        waiting_a["framed"] = None
+        waiting_a["event"] = None
+        waiting_a["thread"] = None
+
+    def _handle_role_a(framed):
+        """ROLE_A 上线：替换旧的等待者，启动等待守护线程。"""
+        promote_event = threading.Event()
+
+        def _keeper():
+            alive = waiting_keepalive(framed, promote_event, label="B<->A")
+            if not alive:
+                # 自然死亡：从 waiting 中清除（如果还指向自己）
+                with waiting_lock:
+                    if waiting_a["framed"] is framed:
+                        waiting_a["framed"] = None
+                        waiting_a["event"] = None
+                        waiting_a["thread"] = None
+
+        with waiting_lock:
+            _release_waiting_a_locked(reason="A 重连，关闭旧挂机连接")
+            waiting_a["framed"] = framed
+            waiting_a["event"] = promote_event
+            t = threading.Thread(target=_keeper, daemon=True)
+            waiting_a["thread"] = t
+        t.start()
+        print("[+] A 已挂机，等待 C 接入")
+
+    def _handle_role_c(framed_c):
+        """ROLE_C 上线：若 A 不在则立即拒绝；否则提升 A 并桥接。"""
+        with waiting_lock:
+            framed_a = waiting_a["framed"]
+            event_a = waiting_a["event"]
+            thread_a = waiting_a["thread"]
+            # 抢占 A，避免被并发的另一个 C 抢走
+            if framed_a is not None:
+                waiting_a["framed"] = None
+                waiting_a["event"] = None
+                waiting_a["thread"] = None
+
+        if framed_a is None:
+            print("[!] C 接入但 A 未挂机，拒绝")
+            try:
+                framed_c.send(FRAME_CLOSE)
+            except Exception:
+                pass
+            framed_c.close()
+            return
+
+        # 通知 A 的 keeper 退出（让出 socket 控制权），并等其结束
+        event_a.set()
+        if thread_a is not None:
+            thread_a.join(timeout=5)
+
+        if framed_a.closed:
+            # 在我们抢占后、让出之前 A 恰好死了
+            print("[!] A 在配对瞬间已断开，拒绝 C")
+            try:
+                framed_c.send(FRAME_CLOSE)
+            except Exception:
+                pass
+            framed_c.close()
+            return
+
+        _start_bridge(framed_a, framed_c)
 
     try:
         while True:
             conn, addr = server.accept()
             try:
-                # 握手仍是裸字节：前 8 字节角色名 + 32 字节 HMAC
                 role = _recv_exact(conn, 8).decode(errors="ignore").strip()
                 token = _recv_exact(conn, 32)
 
@@ -56,21 +136,10 @@ def main():
                 print(f"[+] {role} 认证成功: {addr}")
                 framed = FramedConn(conn, name=f"B<->{role}")
 
-                pair = None
-                with waiting_lock:
-                    # 同角色重连：把旧的等待连接关掉
-                    old = waiting[role]
-                    if old is not None:
-                        print(f"[!] {role} 已存在等待连接，关闭旧连接")
-                        old.close()
-                    waiting[role] = framed
-
-                    if waiting["ROLE_A"] and waiting["ROLE_C"]:
-                        pair = (waiting["ROLE_A"], waiting["ROLE_C"])
-                        waiting["ROLE_A"] = waiting["ROLE_C"] = None
-
-                if pair is not None:
-                    _start_bridge(pair[0], pair[1])
+                if role == "ROLE_A":
+                    _handle_role_a(framed)
+                else:
+                    _handle_role_c(framed)
 
             except Exception as e:
                 print(f"[!] 处理连接时出错: {e}")
@@ -79,9 +148,7 @@ def main():
         print("\n[*] 收到退出信号，关闭服务...")
     finally:
         with waiting_lock:
-            for f in waiting.values():
-                if f is not None:
-                    f.close()
+            _release_waiting_a_locked(reason="服务退出")
         safe_close_sock(server)
 
 
