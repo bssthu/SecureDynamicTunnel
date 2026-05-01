@@ -61,6 +61,9 @@ class FramedConn:
         self._send_lock = threading.Lock()
         self._closed = False
         self.last_recv = time.time()
+        # 持久接收缓冲：跨多次 recv_frame 调用保留未消费完的字节，
+        # 避免 socket 超时中断中间丢弃部分帧头/载荷。
+        self._rx_buf = bytearray()
 
     @property
     def closed(self):
@@ -75,23 +78,27 @@ class FramedConn:
         with self._send_lock:
             self.sock.sendall(header + payload)
 
-    def _recv_exact(self, n):
-        buf = bytearray()
-        while len(buf) < n:
-            chunk = self.sock.recv(n - len(buf))
+    def _fill_until(self, target_len):
+        """读取直到 _rx_buf 至少有 target_len 字节。
+        socket.timeout 时保留已读字节并向上抛，下次可继续。"""
+        while len(self._rx_buf) < target_len:
+            chunk = self.sock.recv(target_len - len(self._rx_buf))
             if not chunk:
                 raise FrameError(f"{self.name} 对端关闭")
-            buf.extend(chunk)
-        return bytes(buf)
+            self._rx_buf.extend(chunk)
+            self.last_recv = time.time()  # 收到任何字节都算活动
 
     def recv_frame(self):
-        """读取一帧；socket.timeout 会原样抛出供上层做看门狗检查。"""
-        header = self._recv_exact(HEADER_LEN)
-        ftype, length = _HDR.unpack(header)
+        """读取一帧；socket.timeout 会原样抛出供上层做看门狗检查。所有已读字节会被保留。"""
+        self._fill_until(HEADER_LEN)
+        ftype, length = _HDR.unpack_from(self._rx_buf, 0)
         if length > MAX_PAYLOAD:
             raise FrameError(f"非法 payload 长度: {length}")
-        payload = self._recv_exact(length) if length else b""
-        self.last_recv = time.time()
+        total = HEADER_LEN + length
+        if length:
+            self._fill_until(total)
+        payload = bytes(self._rx_buf[HEADER_LEN:total])
+        del self._rx_buf[:total]
         return ftype, payload
 
     def close(self):
