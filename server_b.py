@@ -28,8 +28,8 @@ def _start_bridge(framed_a, framed_c):
             run_bridge(framed_a, framed_c)
         finally:
             print("[***] A-C 隧道已关闭")
+    print("[***] A-C 配对完成，开始桥接")
     threading.Thread(target=_run, daemon=True).start()
-    print("[***] A-C 隧道建立成功！")
 
 
 def main():
