@@ -16,24 +16,27 @@
 - A、C 都通过 8 字节角色名 + 32 字节 HMAC 完成与 B 的握手认证。
 - 认证后所有通信走 `framing.py` 定义的应用层帧协议：`1B 类型 + 4B 长度 + payload`，类型包括 `DATA / PING / PONG / CLOSE`。
 - 心跳：每条 TCP 链路每 `HEARTBEAT_INTERVAL=15s` 发一次 PING；`HEARTBEAT_TIMEOUT=45s` 内未收到任何帧即判定对端死亡，主动关闭链路。
-- 断线重连：A、C 均支持自动重连。`RECONNECT_MAX_RETRIES = 0` 表示无限重连；>0 时连续失败超过该次数即放弃（A 退出进程；C 关闭对应的本地用户连接）。
-- 配对策略：A 启动后会主动拨号到 B 并挂机等待；C 仅在本地端口收到业务请求时才按需连 B。若业务请求到达时 B 上没有可用的 A，B 会立即向 C 回送 `CLOSE` 帧，C 随即关闭本次本地用户连接，避免浏览器等到超时。三个进程的启动顺序无关，只要业务请求发起的瞬间 A、B、C 三端都在线即可正常穿透。
+- 断线重连：A、C 均支持自动重连。`config.py` 中的 `A_RECONNECT_MAX_RETRIES` / `C_RECONNECT_MAX_RETRIES` 为 `0` 表示无限重连；>0 时连续失败超过该次数即放弃（A worker 退出；C 关闭对应的本地用户连接）。A 默认失败重连间隔为 `A_RECONNECT_INTERVAL=0.5s`，一次业务隧道结束后会立即重连补位。
+- 配对策略：A 启动后会按 `A_WORKERS=4` 主动拨号到 B，B 维护等待 A 队列；C 仅在本地端口收到业务请求时才按需连 B。若业务请求到达时 B 暂无可用 A，B 会等待最多 `C_WAIT_TIMEOUT=10s`；期间有 A 补位则立即配对，否则通过 C 侧帧协议返回 `HTTP 503`，再关闭本次连接，避免上游只看到 EOF。
 
 ### 快速开始
-1. **统一配置**: 修改 `secret_tool.py` 中的 `SHARED_KEY`。
+1. **统一配置**: 修改 `config.py` 中的 `SHARED_KEY`、B 地址、端口和 worker 等参数。
 2. **部署 B (Linux)**:
    - 运行 `python3 server_b.py`
    - 确保云主机关联的安全组已开放 TCP `9001` 端口。
 3. **部署 A (Windows/Linux)**:
-   - 修改 `client_a.py` 中的 `B_SERVER_IP` 为 B 的公网地址。
+   - 修改 `config.py` 中的 `B_SERVER_IP` 为 B 的公网地址。
+   - 按需调整 `A_WORKERS`；HTTP/SSE 并发越高，建议保持多条 A 连接常驻等待。
    - 运行 `python client_a.py`。
 4. **部署 C (Windows)**:
-   - 修改 `client_c.py` 中的 `B_SERVER_IP`；如需局域网内其他机器访问，把 `BIND_IP` 改为 `0.0.0.0` 或具体网卡地址。
+   - 修改 `config.py` 中的 `B_SERVER_IP`；如需局域网内其他机器访问，把 `C_BIND_IP` 改为 `0.0.0.0` 或具体网卡地址。
    - 运行 `python client_c.py`。
-   - 打开浏览器访问 `http://127.0.0.1:8080`（或上面配置的 `BIND_IP:LOCAL_LISTEN_PORT`）。
+   - 打开浏览器访问 `http://127.0.0.1:8080`（或 `config.py` 中配置的 `C_BIND_IP:C_LOCAL_LISTEN_PORT`）。
 
 ### 注意事项
 - B 现在感知应用层帧（用于配对管理与心跳），但仍**不解密业务数据**——`DATA` 帧的 payload 原样透传。
 - 三端必须同时升级到当前版本，新旧版本之间的握手/帧格式不兼容。
+- `config.py` 负责集中配置；`tunnel_common.py` 负责三端复用的角色名、握手收发和认证辅助逻辑。
+- B 的 A 等待队列上限默认为 `WAITING_A_MAX=64`；超过后会拒绝新的 A 挂机连接。
 - 本脚本为双向同步长连接设计。若需极高并发，建议把 B 的转发循环改为异步 IO 实现。
 - 建议使用 `nohup` 或 `screen` 在 B 机器后台运行。

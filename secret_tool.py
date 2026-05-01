@@ -4,8 +4,7 @@ import hmac
 import hashlib
 import time
 
-# [重要] 请在三台机器上保持此 Key 一致
-SHARED_KEY = "Your_Super_Strong_Random_Secret_Key_2026" 
+from config import SHARED_KEY
 
 def generate_token(role):
     """基于当前分钟生成动态 HMAC Token"""

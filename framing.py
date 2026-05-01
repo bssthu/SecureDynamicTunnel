@@ -19,6 +19,16 @@ import struct
 import threading
 import time
 
+from config import (
+    ALLOW_RAW_C_COMPAT,
+    FRAME_MAX_PAYLOAD,
+    HEARTBEAT_ENABLED,
+    HEARTBEAT_INTERVAL,
+    HEARTBEAT_TIMEOUT,
+    RECV_POLL,
+)
+from log_utils import log
+
 FRAME_DATA = 0x01
 FRAME_PING = 0x02
 FRAME_PONG = 0x03
@@ -27,17 +37,7 @@ _VALID_FRAME_TYPES = {FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE}
 
 _HDR = struct.Struct("!BI")
 HEADER_LEN = _HDR.size
-MAX_PAYLOAD = 1 << 20  # 1 MiB，防止异常长度撑爆内存
-
-# 心跳参数（每条链路独立维护）
-HEARTBEAT_ENABLED = True  # 是否启用应用层心跳/看门狗；关闭后只依赖 TCP 自身
-HEARTBEAT_INTERVAL = 15   # 秒：每隔多久发一次 PING
-HEARTBEAT_TIMEOUT = 45    # 秒：多久没收到任何帧就视为对端死亡
-RECV_POLL = 1.0           # 秒：recv 超时粒度，让看门狗可以周期检查
-
-# 协议严格模式：握手认证完成后，A/B/C 之间默认必须全部使用帧协议。
-# 只有需要临时兼容旧版 C 端时，才手动改为 True。
-ALLOW_RAW_C_COMPAT = False
+MAX_PAYLOAD = FRAME_MAX_PAYLOAD
 
 
 class FrameError(Exception):
@@ -166,21 +166,21 @@ def waiting_keepalive(framed, promote_event, label=""):
             elif ftype == FRAME_PONG:
                 pass
             elif ftype == FRAME_CLOSE:
-                print(f"[{label}] 等待期收到 CLOSE")
+                log(f"[{label}] 等待期收到 CLOSE")
                 framed.close()
                 return False
             else:
-                print(f"[{label}] 等待期收到非法帧类型: {ftype}")
+                log(f"[{label}] 等待期收到非法帧类型: {ftype}")
                 framed.close()
                 return False
         except socket.timeout:
             pass
         except FrameError as e:
-            print(f"[{label}] 等待期帧错误: {e}")
+            log(f"[{label}] 等待期帧错误: {e}")
             framed.close()
             return False
         except Exception as e:
-            print(f"[{label}] 等待期 recv 异常: {e}")
+            log(f"[{label}] 等待期 recv 异常: {e}")
             framed.close()
             return False
 
@@ -194,7 +194,7 @@ def waiting_keepalive(framed, promote_event, label=""):
                     framed.close()
                     return False
             if now - framed.last_recv > HEARTBEAT_TIMEOUT:
-                print(f"[{label}] 等待期心跳超时")
+                log(f"[{label}] 等待期心跳超时")
                 framed.close()
                 return False
 
@@ -231,7 +231,7 @@ def run_endpoint(framed, raw_sock, role_label=""):
     def watchdog():
         while not stop.wait(RECV_POLL):
             if time.time() - framed.last_recv > HEARTBEAT_TIMEOUT:
-                print(f"[{role_label}] 心跳超时，断开链路")
+                log(f"[{role_label}] 心跳超时，断开链路")
                 stop.set()
                 # 关掉 socket 让阻塞中的 recv 立即返回
                 safe_close_sock(framed.sock)
@@ -251,11 +251,11 @@ def run_endpoint(framed, raw_sock, role_label=""):
             except socket.timeout:
                 continue
             except FrameError as e:
-                print(f"[{role_label}] 帧错误: {e}")
+                log(f"[{role_label}] 帧错误: {e}")
                 break
             except Exception as e:
                 if not stop.is_set():
-                    print(f"[{role_label}] recv 异常: {e}")
+                    log(f"[{role_label}] recv 异常: {e}")
                 break
 
             if ftype == FRAME_DATA:
@@ -271,10 +271,10 @@ def run_endpoint(framed, raw_sock, role_label=""):
             elif ftype == FRAME_PONG:
                 pass  # last_recv 已更新
             elif ftype == FRAME_CLOSE:
-                print(f"[{role_label}] 收到对端 CLOSE")
+                log(f"[{role_label}] 收到对端 CLOSE")
                 break
             else:
-                print(f"[{role_label}] 未知帧类型: {ftype}")
+                log(f"[{role_label}] 未知帧类型: {ftype}")
                 break
     finally:
         stop.set()
@@ -296,7 +296,7 @@ def _recv_first_c_item(framed_c):
             if raw and raw[0] not in _VALID_FRAME_TYPES:
                 preview = raw[:16]
                 if ALLOW_RAW_C_COMPAT:
-                    print(f"[B] C 侧首包不是帧协议，切换为裸流兼容模式: {e}; 预览={preview!r}")
+                    log(f"[B] C 侧首包不是帧协议，切换为裸流兼容模式: {e}; 预览={preview!r}")
                     return "raw", raw
                 raise FrameError(f"C 侧首包不是帧协议，已拒绝裸流: {e}; 预览={preview!r}")
             raise
@@ -326,7 +326,7 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
     def watchdog_a():
         while not stop.wait(RECV_POLL):
             if time.time() - framed_a.last_recv > HEARTBEAT_TIMEOUT:
-                print("[B] A 侧心跳超时")
+                log("[B] A 侧心跳超时")
                 stop.set()
                 safe_close_sock(framed_a.sock)
                 safe_close_sock(c_sock)
@@ -341,11 +341,11 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
                     continue
                 except FrameError as e:
                     if not stop.is_set():
-                        print(f"[B] A->C 帧错误: {e}")
+                        log(f"[B] A->C 帧错误: {e}")
                     break
                 except Exception as e:
                     if not stop.is_set():
-                        print(f"[B] A->C 读取异常: {e}")
+                        log(f"[B] A->C 读取异常: {e}")
                     break
 
                 if ftype == FRAME_DATA:
@@ -353,7 +353,7 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
                         c_sock.sendall(payload)
                     except Exception as e:
                         if not stop.is_set():
-                            print(f"[B] A->C 转发失败: {e}")
+                            log(f"[B] A->C 转发失败: {e}")
                         break
                 elif ftype == FRAME_PING:
                     try:
@@ -363,7 +363,7 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
                 elif ftype == FRAME_PONG:
                     pass
                 elif ftype == FRAME_CLOSE:
-                    print("[B] A->C 收到 CLOSE")
+                    log("[B] A->C 收到 CLOSE")
                     break
         finally:
             stop.set()
@@ -386,11 +386,11 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
                     framed_a.send(FRAME_DATA, data)
                 except Exception as e:
                     if not stop.is_set():
-                        print(f"[B] C->A 转发失败: {e}")
+                        log(f"[B] C->A 转发失败: {e}")
                     break
         except Exception as e:
             if not stop.is_set():
-                print(f"[B] C->A 裸流读取异常: {e}")
+                log(f"[B] C->A 裸流读取异常: {e}")
         finally:
             stop.set()
 
@@ -423,13 +423,13 @@ def run_bridge(framed_a, framed_c):
     try:
         c_mode, first_payload = _recv_first_c_item(framed_c)
     except Exception as e:
-        print(f"[B] C 侧首包读取失败: {e}")
+        log(f"[B] C 侧首包读取失败: {e}")
         framed_a.close()
         framed_c.close()
         return
 
     if c_mode == "close":
-        print("[B] C->A 收到 CLOSE")
+        log("[B] C->A 收到 CLOSE")
         framed_a.close()
         framed_c.close()
         return
@@ -441,7 +441,7 @@ def run_bridge(framed_a, framed_c):
     try:
         framed_a.send(FRAME_DATA, first_payload)
     except Exception as e:
-        print(f"[B] C->A 首包转发失败: {e}")
+        log(f"[B] C->A 首包转发失败: {e}")
         framed_a.close()
         framed_c.close()
         return
@@ -450,13 +450,13 @@ def run_bridge(framed_a, framed_c):
         while not stop.wait(RECV_POLL):
             now = time.time()
             if now - framed_a.last_recv > HEARTBEAT_TIMEOUT:
-                print("[B] A 侧心跳超时")
+                log("[B] A 侧心跳超时")
                 stop.set()
                 safe_close_sock(framed_a.sock)
                 safe_close_sock(framed_c.sock)
                 return
             if now - framed_c.last_recv > HEARTBEAT_TIMEOUT:
-                print("[B] C 侧心跳超时")
+                log("[B] C 侧心跳超时")
                 stop.set()
                 safe_close_sock(framed_a.sock)
                 safe_close_sock(framed_c.sock)
@@ -471,11 +471,11 @@ def run_bridge(framed_a, framed_c):
                     continue
                 except FrameError as e:
                     if not stop.is_set():
-                        print(f"[B] {label} 帧错误: {e}")
+                        log(f"[B] {label} 帧错误: {e}")
                     break
                 except Exception as e:
                     if not stop.is_set():
-                        print(f"[B] {label} 读取异常: {e}")
+                        log(f"[B] {label} 读取异常: {e}")
                     break
 
                 if ftype == FRAME_DATA:
@@ -483,7 +483,7 @@ def run_bridge(framed_a, framed_c):
                         dst.send(FRAME_DATA, payload)
                     except Exception as e:
                         if not stop.is_set():
-                            print(f"[B] {label} 转发失败: {e}")
+                            log(f"[B] {label} 转发失败: {e}")
                         break
                 elif ftype == FRAME_PING:
                     try:
@@ -493,7 +493,7 @@ def run_bridge(framed_a, framed_c):
                 elif ftype == FRAME_PONG:
                     pass
                 elif ftype == FRAME_CLOSE:
-                    print(f"[B] {label} 收到 CLOSE")
+                    log(f"[B] {label} 收到 CLOSE")
                     break
         finally:
             stop.set()
