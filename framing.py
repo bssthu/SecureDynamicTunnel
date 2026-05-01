@@ -29,6 +29,7 @@ HEADER_LEN = _HDR.size
 MAX_PAYLOAD = 1 << 20  # 1 MiB，防止异常长度撑爆内存
 
 # 心跳参数（每条链路独立维护）
+HEARTBEAT_ENABLED = True  # 是否启用应用层心跳/看门狗；关闭后只依赖 TCP 自身
 HEARTBEAT_INTERVAL = 15   # 秒：每隔多久发一次 PING
 HEARTBEAT_TIMEOUT = 45    # 秒：多久没收到任何帧就视为对端死亡
 RECV_POLL = 1.0           # 秒：recv 超时粒度，让看门狗可以周期检查
@@ -109,6 +110,8 @@ class FramedConn:
 
 def _heartbeat_loop(conn, stop_event):
     """周期性向对端发送 PING；conn 关闭或被通知停止时退出。"""
+    if not HEARTBEAT_ENABLED:
+        return
     while not stop_event.wait(HEARTBEAT_INTERVAL):
         if conn.closed:
             return
@@ -162,18 +165,19 @@ def waiting_keepalive(framed, promote_event, label=""):
             framed.close()
             return False
 
-        now = time.time()
-        if now - last_ping >= HEARTBEAT_INTERVAL:
-            try:
-                framed.send(FRAME_PING)
-                last_ping = now
-            except Exception:
+        if HEARTBEAT_ENABLED:
+            now = time.time()
+            if now - last_ping >= HEARTBEAT_INTERVAL:
+                try:
+                    framed.send(FRAME_PING)
+                    last_ping = now
+                except Exception:
+                    framed.close()
+                    return False
+            if now - framed.last_recv > HEARTBEAT_TIMEOUT:
+                print(f"[{label}] 等待期心跳超时")
                 framed.close()
                 return False
-        if now - framed.last_recv > HEARTBEAT_TIMEOUT:
-            print(f"[{label}] 等待期心跳超时")
-            framed.close()
-            return False
 
     # 被提升为正式配对：清掉 timeout，让上层重新设置
     try:
@@ -217,8 +221,9 @@ def run_endpoint(framed, raw_sock, role_label=""):
     framed.sock.settimeout(RECV_POLL)
 
     threading.Thread(target=raw_to_frame, daemon=True).start()
-    threading.Thread(target=_heartbeat_loop, args=(framed, stop), daemon=True).start()
-    threading.Thread(target=watchdog, daemon=True).start()
+    if HEARTBEAT_ENABLED:
+        threading.Thread(target=_heartbeat_loop, args=(framed, stop), daemon=True).start()
+        threading.Thread(target=watchdog, daemon=True).start()
 
     try:
         while not stop.is_set():
@@ -321,10 +326,11 @@ def run_bridge(framed_a, framed_c):
     threads = [
         threading.Thread(target=pump, args=(framed_a, framed_c, "A->C"), daemon=True),
         threading.Thread(target=pump, args=(framed_c, framed_a, "C->A"), daemon=True),
-        threading.Thread(target=_heartbeat_loop, args=(framed_a, stop), daemon=True),
-        threading.Thread(target=_heartbeat_loop, args=(framed_c, stop), daemon=True),
-        threading.Thread(target=watchdog, daemon=True),
     ]
+    if HEARTBEAT_ENABLED:
+        threads.append(threading.Thread(target=_heartbeat_loop, args=(framed_a, stop), daemon=True))
+        threads.append(threading.Thread(target=_heartbeat_loop, args=(framed_c, stop), daemon=True))
+        threads.append(threading.Thread(target=watchdog, daemon=True))
     for t in threads:
         t.start()
 
