@@ -8,10 +8,13 @@
     +--------+----------------+-----------------+
 
 类型：
-    0x01 DATA   业务字节流分段
-    0x02 PING   心跳请求
-    0x03 PONG   心跳应答
-    0x04 CLOSE  优雅关闭通知（payload 通常为空）
+    0x01 DATA         业务字节流分段（多流模式下 payload 前 2B 为 stream_id）
+    0x02 PING         心跳请求
+    0x03 PONG         心跳应答
+    0x04 CLOSE        优雅关闭通知（payload 通常为空）
+    0x05 PAIR         B→A 通知有新 C 接入（payload: 2B stream_id）
+    0x06 PAIR_ACK     A→B 确认已建立本地连接（payload: 2B stream_id）
+    0x07 STREAM_CLOSE 通知对端关闭某个 stream（payload: 2B stream_id）
 """
 
 import socket
@@ -33,7 +36,14 @@ FRAME_DATA = 0x01
 FRAME_PING = 0x02
 FRAME_PONG = 0x03
 FRAME_CLOSE = 0x04
-_VALID_FRAME_TYPES = {FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE}
+FRAME_PAIR = 0x05
+FRAME_PAIR_ACK = 0x06
+FRAME_STREAM_CLOSE = 0x07
+_VALID_FRAME_TYPES = {FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
+                      FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE}
+
+STREAM_ID_STRUCT = struct.Struct("!H")
+STREAM_ID_LEN = STREAM_ID_STRUCT.size
 
 _HDR = struct.Struct("!BI")
 HEADER_LEN = _HDR.size
@@ -215,6 +225,7 @@ def run_endpoint(framed, raw_sock, role_label=""):
     阻塞直到任一侧关闭或心跳超时。返回时两侧 socket 均已关闭。
     """
     stop = threading.Event()
+    counters = {"raw_to_frame": 0, "frame_to_raw": 0}
 
     def raw_to_frame():
         try:
@@ -223,6 +234,7 @@ def run_endpoint(framed, raw_sock, role_label=""):
                 if not data:
                     break
                 framed.send(FRAME_DATA, data)
+                counters["raw_to_frame"] += len(data)
         except Exception:
             pass
         finally:
@@ -261,6 +273,7 @@ def run_endpoint(framed, raw_sock, role_label=""):
             if ftype == FRAME_DATA:
                 try:
                     raw_sock.sendall(payload)
+                    counters["frame_to_raw"] += len(payload)
                 except Exception:
                     break
             elif ftype == FRAME_PING:
@@ -278,6 +291,11 @@ def run_endpoint(framed, raw_sock, role_label=""):
                 break
     finally:
         stop.set()
+        log(
+            f"[{role_label}] endpoint_closed "
+            f"raw_to_frame_bytes={counters['raw_to_frame']} "
+            f"frame_to_raw_bytes={counters['frame_to_raw']}"
+        )
         framed.close()
         safe_close_sock(raw_sock)
 
@@ -512,3 +530,200 @@ def run_bridge(framed_a, framed_c):
     stop.wait()
     framed_a.close()
     framed_c.close()
+
+
+# ---------------------------------------------------------------------------
+# 多流（Multi-Stream）模式：一个 A 连接同时服务多个 C
+# ---------------------------------------------------------------------------
+
+def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, role_label="A"):
+    """
+    A 端多流循环：保持与 B 的单条长连接，通过 PAIR/DATA/STREAM_CLOSE 帧
+    处理多个并发 C 会话，每个会话在独立线程中与本地服务双向转发。
+
+    framed            : 已与 B 完成握手的 FramedConn
+    local_service_addr: (host, port) 本地服务地址
+    connect_timeout   : 连接本地服务的超时秒数
+    """
+    stop = threading.Event()
+    # streams: stream_id -> dict(sock, pending, ready_event, closed)
+    # 主循环收到 PAIR 时同步登记 entry（sock=None），然后异步去 connect 本地服务；
+    # 期间到达的 DATA 暂存到 pending，connect 成功后回放，避免数据丢失。
+    streams = {}
+    streams_lock = threading.Lock()
+
+    framed.sock.settimeout(RECV_POLL)
+
+    def _close_stream(sid, reason=""):
+        with streams_lock:
+            entry = streams.pop(sid, None)
+            if entry is None:
+                return
+            entry["closed"] = True
+            sock = entry["sock"]
+        if reason:
+            log(f"[{role_label}] stream {sid} 关闭: {reason}")
+        if sock is not None:
+            safe_close_sock(sock)
+
+    def _local_to_framed(sid, local_sock):
+        """本地服务 → B（DATA 帧，前 2B 为 stream_id）"""
+        prefix = STREAM_ID_STRUCT.pack(sid)
+        try:
+            while not stop.is_set():
+                try:
+                    data = local_sock.recv(8192)
+                except Exception:
+                    break
+                if not data:
+                    break
+                try:
+                    framed.send(FRAME_DATA, prefix + data)
+                except Exception:
+                    break
+        finally:
+            try:
+                framed.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
+            except Exception:
+                pass
+            _close_stream(sid)
+
+    def _start_stream(sid):
+        """异步：连接本地服务，连成功后把 pending 缓冲回放进去并发 PAIR_ACK。"""
+        local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        local_sock.settimeout(connect_timeout)
+        try:
+            local_sock.connect(local_service_addr)
+        except Exception as e:
+            log(f"[{role_label}] stream {sid} 连接本地服务失败: {e}")
+            safe_close_sock(local_sock)
+            with streams_lock:
+                streams.pop(sid, None)
+            try:
+                framed.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
+            except Exception:
+                pass
+            return
+        local_sock.settimeout(None)
+
+        with streams_lock:
+            entry = streams.get(sid)
+            if entry is None or entry["closed"]:
+                safe_close_sock(local_sock)
+                return
+            buffered = entry["pending"]
+            entry["pending"] = []
+            entry["sock"] = local_sock
+
+        # 回放缓冲（已脱离锁，避免阻塞主循环登记 / 关闭）
+        try:
+            for chunk in buffered:
+                local_sock.sendall(chunk)
+        except Exception as e:
+            log(f"[{role_label}] stream {sid} 回放缓冲失败: {e}")
+            _close_stream(sid)
+            return
+
+        try:
+            framed.send(FRAME_PAIR_ACK, STREAM_ID_STRUCT.pack(sid))
+        except Exception as e:
+            log(f"[{role_label}] stream {sid} PAIR_ACK 发送失败: {e}")
+            _close_stream(sid)
+            return
+        log(f"[{role_label}] stream {sid} 已建立本地连接 {local_service_addr}")
+        threading.Thread(target=_local_to_framed, args=(sid, local_sock), daemon=True).start()
+
+    def watchdog():
+        while not stop.wait(RECV_POLL):
+            if time.time() - framed.last_recv > HEARTBEAT_TIMEOUT:
+                log(f"[{role_label}] 心跳超时，断开链路")
+                stop.set()
+                safe_close_sock(framed.sock)
+                return
+
+    if HEARTBEAT_ENABLED:
+        threading.Thread(target=_heartbeat_loop, args=(framed, stop), daemon=True).start()
+        threading.Thread(target=watchdog, daemon=True).start()
+
+    try:
+        while not stop.is_set():
+            try:
+                ftype, payload = framed.recv_frame()
+            except socket.timeout:
+                continue
+            except FrameError as e:
+                log(f"[{role_label}] 帧错误: {e}")
+                break
+            except Exception as e:
+                if not stop.is_set():
+                    log(f"[{role_label}] recv 异常: {e}")
+                break
+
+            if ftype == FRAME_PAIR:
+                if len(payload) < STREAM_ID_LEN:
+                    log(f"[{role_label}] PAIR 帧 payload 过短")
+                    break
+                sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
+                log(f"[{role_label}] 收到 PAIR stream_id={sid}")
+                # 同步登记 entry，确保后续 DATA 不会因为 connect 还没完成而丢失
+                with streams_lock:
+                    streams[sid] = {
+                        "sock": None,
+                        "pending": [],
+                        "closed": False,
+                    }
+                threading.Thread(target=_start_stream, args=(sid,), daemon=True).start()
+
+            elif ftype == FRAME_DATA:
+                if len(payload) < STREAM_ID_LEN:
+                    continue
+                sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
+                data = payload[STREAM_ID_LEN:]
+                if not data:
+                    continue
+                with streams_lock:
+                    entry = streams.get(sid)
+                    if entry is None or entry["closed"]:
+                        local_sock = None
+                    elif entry["sock"] is None:
+                        # 还在 connect，先暂存
+                        entry["pending"].append(data)
+                        local_sock = None
+                    else:
+                        local_sock = entry["sock"]
+                if local_sock is not None:
+                    try:
+                        local_sock.sendall(data)
+                    except Exception:
+                        _close_stream(sid, reason="本地写入失败")
+
+            elif ftype == FRAME_STREAM_CLOSE:
+                if len(payload) < STREAM_ID_LEN:
+                    continue
+                sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
+                _close_stream(sid, reason="B 通知关闭")
+
+            elif ftype == FRAME_PING:
+                try:
+                    framed.send(FRAME_PONG)
+                except Exception:
+                    break
+            elif ftype == FRAME_PONG:
+                pass
+            elif ftype == FRAME_CLOSE:
+                log(f"[{role_label}] 收到对端 CLOSE")
+                break
+            else:
+                log(f"[{role_label}] 未知帧类型: {ftype}")
+                break
+    finally:
+        stop.set()
+        with streams_lock:
+            entries = list(streams.values())
+            streams.clear()
+        for entry in entries:
+            entry["closed"] = True
+            sock = entry.get("sock")
+            if sock is not None:
+                safe_close_sock(sock)
+        framed.close()

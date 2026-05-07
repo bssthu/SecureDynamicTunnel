@@ -6,6 +6,7 @@ import threading
 
 from config import (
     A_CONNECT_TIMEOUT,
+    A_MULTI_STREAM,
     A_RECONNECT_INTERVAL,
     A_RECONNECT_MAX_RETRIES,
     A_WORKERS,
@@ -14,7 +15,8 @@ from config import (
     LOCAL_SERVICE_ADDR,
 )
 from framing import (
-    FramedConn, FrameError, run_endpoint, safe_close_sock,
+    FramedConn, FrameError, run_endpoint, run_multi_stream_a_endpoint,
+    safe_close_sock,
     FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
 )
 from log_utils import log
@@ -30,7 +32,7 @@ def _wait_first_data(framed):
     期间也要正确响应 PING，丢弃 PONG。
     返回首份 payload。
     """
-    framed.sock.settimeout(None)  # 等 C 接入可能很久
+    framed.sock.settimeout(None)
     while True:
         ftype, payload = framed.recv_frame()
         if ftype == FRAME_DATA:
@@ -45,30 +47,25 @@ def _wait_first_data(framed):
             raise FrameError(f"挂机阶段未知帧类型: {ftype}")
 
 
-def _one_round(worker_id=1):
-    """完成一次：连 B → 等 C → 连本地服务 → 帧化双向转发（含心跳）。"""
+def _one_round_single(worker_id=1):
+    """单流模式：连B → 等C → 连本地服务 → 帧化双向转发。"""
     b_sock = None
     local_sock = None
     framed = None
     try:
-        # 1. 拨号到 B
         b_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         b_sock.settimeout(A_CONNECT_TIMEOUT)
         b_sock.connect((B_SERVER_IP, B_SERVER_PORT))
-
-        # 2. 握手认证（裸字节，与帧协议无关）
         send_role_handshake(b_sock, ROLE_A)
         b_sock.settimeout(None)
         log(f"[A-{worker_id}] connected_to_b {B_SERVER_IP}:{B_SERVER_PORT}")
 
-        # 3. 切换为帧化连接，等 C 的第一份业务数据
         framed = FramedConn(b_sock, name=f"A-{worker_id}<->B")
-        b_sock = None  # 所有权移交 framed
+        b_sock = None
         log(f"[A-{worker_id}] 已挂载，等待 C 接入...")
         first_payload = _wait_first_data(framed)
         log(f"[A-{worker_id}] paired first_payload_bytes={len(first_payload)}")
 
-        # 4. 连接本地服务，把第一份数据投递过去
         local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         local_sock.settimeout(A_CONNECT_TIMEOUT)
         try:
@@ -80,7 +77,6 @@ def _one_round(worker_id=1):
         log(f"[A-{worker_id}] local_service_connected {LOCAL_SERVICE_ADDR}")
         local_sock.sendall(first_payload)
 
-        # 5. 进入双向帧化转发循环（含 PING/PONG 心跳与看门狗）
         run_endpoint(framed, local_sock, role_label=f"A-{worker_id}")
         log(f"[A-{worker_id}] session_closed")
         framed = None
@@ -92,13 +88,42 @@ def _one_round(worker_id=1):
         safe_close_sock(local_sock)
 
 
+def _one_round_multi(worker_id=1):
+    """多流模式：连B后保持长连接，通过 run_multi_stream_a_endpoint 处理多个并发 C。"""
+    b_sock = None
+    framed = None
+    try:
+        b_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        b_sock.settimeout(A_CONNECT_TIMEOUT)
+        b_sock.connect((B_SERVER_IP, B_SERVER_PORT))
+        send_role_handshake(b_sock, ROLE_A)
+        b_sock.settimeout(None)
+        log(f"[A-{worker_id}] connected_to_b(multi) {B_SERVER_IP}:{B_SERVER_PORT}")
+
+        framed = FramedConn(b_sock, name=f"A-{worker_id}<->B")
+        b_sock = None
+        log(f"[A-{worker_id}] 已挂载(多流模式)，等待 C 接入...")
+
+        run_multi_stream_a_endpoint(
+            framed, LOCAL_SERVICE_ADDR, A_CONNECT_TIMEOUT,
+            role_label=f"A-{worker_id}",
+        )
+        log(f"[A-{worker_id}] multi_stream_session_closed")
+        framed = None
+    finally:
+        if framed is not None:
+            framed.close()
+        safe_close_sock(b_sock)
+
+
 def connect_loop(worker_id=1):
+    one_round = _one_round_multi if A_MULTI_STREAM else _one_round_single
     fail_count = 0
     try:
         while not _shutdown_event.is_set():
             try:
-                _one_round(worker_id)
-                fail_count = 0  # 一次完整会话成功后重置
+                one_round(worker_id)
+                fail_count = 0
             except Exception as e:
                 fail_count += 1
                 if A_RECONNECT_MAX_RETRIES and fail_count > A_RECONNECT_MAX_RETRIES:
@@ -112,10 +137,11 @@ def connect_loop(worker_id=1):
 
 def main():
     _shutdown_event.clear()
-    worker_count = max(1, int(A_WORKERS))
+    worker_count = 1 if A_MULTI_STREAM else max(1, int(A_WORKERS))
     threads = []
     log(
         f"[*] A 客户端启动，file={__file__} "
+        f"mode={'multi-stream' if A_MULTI_STREAM else 'single-stream'} "
         f"workers={worker_count} reconnect_interval={A_RECONNECT_INTERVAL}s"
     )
     for worker_id in range(1, worker_count + 1):

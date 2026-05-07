@@ -2,8 +2,11 @@
 
 import socket
 import threading
+import time
+from itertools import count
 
 from config import (
+    A_MULTI_STREAM,
     B_SERVER_IP,
     B_SERVER_PORT,
     C_ACCEPT_POLL,
@@ -14,12 +17,16 @@ from config import (
     C_RECONNECT_INTERVAL,
     C_RECONNECT_MAX_RETRIES,
 )
-from framing import FramedConn, run_endpoint, safe_close_sock, FRAME_PING
+from framing import (
+    FramedConn, run_endpoint, safe_close_sock,
+    FRAME_PING,
+)
 from log_utils import log
 from tunnel_common import ROLE_C, send_role_handshake
 
 _shutdown_event = threading.Event()
 _active_socks = set()
+_conn_id_counter = count(1)
 _active_lock = threading.Lock()
 
 
@@ -77,25 +84,37 @@ def connect_to_b():
 
 
 def bridge_handler(c_user_conn):
+    cid = next(_conn_id_counter)
+    started = time.monotonic()
+    try:
+        peer = c_user_conn.getpeername()
+    except Exception:
+        peer = ("?", 0)
+    log(f"[C#{cid}] user_connected from={peer}")
     _track_sock(c_user_conn)
     b_sock = connect_to_b()
     if b_sock is None:
-        # 一直重连不上：正确断开本地连接
+        log(f"[C#{cid}] no_b_connection, closing")
         _untrack_sock(c_user_conn)
         safe_close_sock(c_user_conn)
         return
 
-    framed = FramedConn(b_sock, name="C<->B")
+    framed = FramedConn(b_sock, name=f"C#{cid}<->B")
     try:
         # 认证后的第一个包必须进入帧协议；先发一个 PING 作为协议标记帧。
         framed.send(FRAME_PING)
-        # 用户裸字节 <-> 帧化的 B 链路。心跳/看门狗由 run_endpoint 内部处理。
-        run_endpoint(framed, c_user_conn, role_label="C")
+        log(f"[C#{cid}] tunnel_open b={b_sock.getpeername()}")
+        # B↔C 始终是一条 TCP、一个流，无论 B 端运行单流还是多流模式：
+        # 多流模式下 B 内部按 stream_id 复用 A 链路，对 C 暴露的依旧是干净的
+        # FRAME_DATA / PING / PONG / CLOSE，因此 C 端无需感知模式差异。
+        run_endpoint(framed, c_user_conn, role_label=f"C#{cid}")
     except Exception as e:
-        log(f"[!] 隧道转发异常: {e}")
+        log(f"[!] [C#{cid}] 隧道转发异常: {e}")
         framed.close()
         safe_close_sock(c_user_conn)
     finally:
+        dur_ms = int((time.monotonic() - started) * 1000)
+        log(f"[C#{cid}] closed duration_ms={dur_ms}")
         _untrack_sock(b_sock)
         _untrack_sock(c_user_conn)
 
@@ -118,7 +137,8 @@ def main():
     ls.settimeout(C_ACCEPT_POLL)
     log(
         f"[*] 客户端代理启动，file={__file__} "
-        f"listen=http://{C_BIND_IP}:{C_LOCAL_LISTEN_PORT}"
+        f"listen=http://{C_BIND_IP}:{C_LOCAL_LISTEN_PORT} "
+        f"mode={'multi-stream' if A_MULTI_STREAM else 'single-stream'}"
     )
 
     try:

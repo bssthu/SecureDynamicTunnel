@@ -18,6 +18,9 @@ A_CONNECT_TIMEOUT = 5
 A_RECONNECT_INTERVAL = 0.5
 A_RECONNECT_MAX_RETRIES = 0
 A_WORKERS = 4
+# Multi-stream mode: one A connection serves multiple concurrent C clients.
+# Set to True on both A and B to enable; False keeps the original 1-A-per-C behavior.
+A_MULTI_STREAM = True
 
 # C-side local proxy.
 C_BIND_IP = "127.0.0.1"
