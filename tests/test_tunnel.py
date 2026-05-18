@@ -53,25 +53,73 @@ def _recv_exact(sock, n):
     return bytes(buf)
 
 
-def _recv_frame(sock):
-    header = _recv_exact(sock, _HDR.size)
+def _recv_frame(target):
+    """统一收帧：FramedConn / _RoleSock 走加密路径，裸 socket 走明文路径。"""
+    if hasattr(target, "recv_frame"):
+        return target.recv_frame()
+    header = _recv_exact(target, _HDR.size)
     ftype, length = _HDR.unpack(header)
-    payload = _recv_exact(sock, length) if length else b""
+    payload = _recv_exact(target, length) if length else b""
     return ftype, payload
 
 
-def _send_frame(sock, ftype, payload=b""):
-    sock.sendall(_HDR.pack(ftype, len(payload)) + payload)
+def _send_frame(target, ftype, payload=b""):
+    """统一发帧：FramedConn / _RoleSock 走加密路径，裸 socket 走明文路径。"""
+    if hasattr(target, "send_frame"):
+        target.send_frame(ftype, payload)
+        return
+    if isinstance(target, FramedConn):
+        target.send(ftype, payload)
+        return
+    target.sendall(_HDR.pack(ftype, len(payload)) + payload)
+
+
+class _RoleSock:
+    """握手后的连接包装：对外暴露 socket-like API（close/settimeout/recv/setblocking）
+    + send_frame/recv_frame，使现有测试无需大幅改动即可适配加密握手。"""
+
+    def __init__(self, framed):
+        self.framed = framed
+        self.sock = framed.sock
+
+    def send_frame(self, ftype, payload=b""):
+        self.framed.send(ftype, payload)
+
+    def recv_frame(self):
+        return self.framed.recv_frame()
+
+    def settimeout(self, t):
+        self.sock.settimeout(t)
+
+    def setblocking(self, flag):
+        self.sock.setblocking(flag)
+
+    def recv(self, n):
+        return self.sock.recv(n)
+
+    def close(self):
+        try:
+            self.framed.close()
+        except Exception:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
 
 
 def _connect_role(port, role):
     sock = socket.create_connection(("127.0.0.1", port), timeout=2)
-    send_role_handshake(sock, role)
+    send_cipher, recv_cipher = send_role_handshake(sock, role)
     sock.settimeout(2)
-    return sock
+    framed = FramedConn(
+        sock, name=f"test-{role}",
+        send_cipher=send_cipher, recv_cipher=recv_cipher,
+    )
+    return _RoleSock(framed)
 
 
-def _assert_not_closed(sock):
+def _assert_not_closed(rs):
+    sock = rs.sock if isinstance(rs, _RoleSock) else rs
     sock.setblocking(False)
     try:
         try:
@@ -79,6 +127,7 @@ def _assert_not_closed(sock):
         except BlockingIOError:
             return
         assert data != b"", "socket was closed"
+        # 加密模式下 CLOSE 帧类型字段在 header 第 1 字节，与明文相同。
         assert data[0] != FRAME_CLOSE, "server sent CLOSE"
     finally:
         sock.setblocking(True)
@@ -140,25 +189,86 @@ def b_server_multi(monkeypatch):
 # ---- 握手测试 ----
 
 def test_role_handshake_round_trip():
+    """对端用 socketpair 跑一整轮 v2 握手；派生出的 cipher 应能互通加解密。"""
     left, right = socket.socketpair()
+
+    # B 端握手放后台线程，避免互相阻塞。
+    result = {}
+
+    def _server_side():
+        try:
+            result["server"] = verify_role_handshake(right)
+        except Exception as e:
+            result["server_err"] = e
+
+    t = threading.Thread(target=_server_side, daemon=True)
+    t.start()
     try:
-        send_role_handshake(left, ROLE_A)
-        role, ok = verify_role_handshake(right)
+        c_send_cipher, c_recv_cipher = send_role_handshake(left, ROLE_A)
+        t.join(timeout=3)
+        assert "server_err" not in result, result.get("server_err")
+        role, ok, s_send_cipher, s_recv_cipher = result["server"]
         assert role == ROLE_A
         assert ok is True
+
+        # 用派生密钥跑一次往返验证：客户端发，服务端解密；反之亦然。
+        aad = b"\x01\x00\x00\x00\x10"
+        ct = c_send_cipher.encrypt(aad, b"hello")
+        assert s_recv_cipher.decrypt(aad, ct) == b"hello"
+
+        ct2 = s_send_cipher.encrypt(aad, b"world")
+        assert c_recv_cipher.decrypt(aad, ct2) == b"world"
     finally:
         left.close()
         right.close()
 
 
 def test_invalid_role_handshake_is_rejected():
+    """伪造一个 ROLE_X + 假公钥/nonce/mac 的握手包，B 应判定失败且不返回 cipher。"""
     left, right = socket.socketpair()
+
+    result = {}
+
+    def _server_side():
+        result["server"] = verify_role_handshake(right)
+
+    t = threading.Thread(target=_server_side, daemon=True)
+    t.start()
     try:
+        # 假握手包：ROLE_X(8B) + 假 pub(32B) + 假 nonce(16B) + 假 mac(32B)
         left.sendall(b"ROLE_X".ljust(ROLE_FIELD_LEN, b" "))
-        left.sendall(b"0" * 32)
-        role, ok = verify_role_handshake(right)
-        assert role == "ROLE_X"
+        left.sendall(b"\x00" * 32)  # pub
+        left.sendall(b"\x00" * 16)  # nonce
+        left.sendall(b"\x00" * 32)  # mac
+        t.join(timeout=3)
+        role, ok, send_cipher, recv_cipher = result["server"]
         assert ok is False
+        assert send_cipher is None and recv_cipher is None
+    finally:
+        left.close()
+        right.close()
+
+
+def test_handshake_mac_mismatch_is_rejected():
+    """合法 role 但 MAC 错误（伪造的 client），B 应拒绝并不返回 cipher。"""
+    left, right = socket.socketpair()
+
+    result = {}
+
+    def _server_side():
+        result["server"] = verify_role_handshake(right)
+
+    t = threading.Thread(target=_server_side, daemon=True)
+    t.start()
+    try:
+        left.sendall(b"ROLE_A".ljust(ROLE_FIELD_LEN, b" "))
+        left.sendall(b"\x00" * 32)  # pub
+        left.sendall(b"\x00" * 16)  # nonce
+        left.sendall(b"\xff" * 32)  # 错误的 mac
+        t.join(timeout=3)
+        role, ok, send_cipher, recv_cipher = result["server"]
+        assert ok is False
+        assert send_cipher is None and recv_cipher is None
     finally:
         left.close()
         right.close()

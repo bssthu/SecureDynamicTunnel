@@ -1,7 +1,10 @@
 # -*- coding: utf-8 -*-
 
 # Shared authentication key. Keep this identical on A, B, and C.
-SHARED_KEY = "Your_Super_Strong_Random_Secret_Key_2026"
+# 必须满足：长度 >= 16 字符，且不能是示例占位值。建议使用 >= 32 字符的高熵随机串，
+# 例如：python -c "import secrets;print(secrets.token_urlsafe(32))"
+# 启动时若不合规会直接抛 SharedKeyError 终止进程。
+SHARED_KEY = ""
 
 # B server listen config.
 B_LISTEN_HOST = "0.0.0.0"

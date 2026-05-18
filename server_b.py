@@ -470,13 +470,16 @@ def main():
 
     def _handle_connection(conn, addr):
         try:
-            role, ok = verify_role_handshake(conn)
+            role, ok, send_cipher, recv_cipher = verify_role_handshake(conn)
             if not ok:
                 log(f"[!] 拒绝非法连接: {addr} role={role!r}")
                 safe_close_sock(conn)
                 return
             log(f"[+] {role} 认证成功: {addr}")
-            framed = FramedConn(conn, name=f"B<->{role}")
+            framed = FramedConn(
+                conn, name=f"B<->{role}",
+                send_cipher=send_cipher, recv_cipher=recv_cipher,
+            )
             if role == ROLE_A:
                 _handle_role_a(framed)
             else:

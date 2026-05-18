@@ -56,11 +56,14 @@ def _one_round_single(worker_id=1):
         b_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         b_sock.settimeout(A_CONNECT_TIMEOUT)
         b_sock.connect((B_SERVER_IP, B_SERVER_PORT))
-        send_role_handshake(b_sock, ROLE_A)
+        send_cipher, recv_cipher = send_role_handshake(b_sock, ROLE_A)
         b_sock.settimeout(None)
         log(f"[A-{worker_id}] connected_to_b {B_SERVER_IP}:{B_SERVER_PORT}")
 
-        framed = FramedConn(b_sock, name=f"A-{worker_id}<->B")
+        framed = FramedConn(
+            b_sock, name=f"A-{worker_id}<->B",
+            send_cipher=send_cipher, recv_cipher=recv_cipher,
+        )
         b_sock = None
         log(f"[A-{worker_id}] 已挂载，等待 C 接入...")
         first_payload = _wait_first_data(framed)
@@ -96,11 +99,14 @@ def _one_round_multi(worker_id=1):
         b_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         b_sock.settimeout(A_CONNECT_TIMEOUT)
         b_sock.connect((B_SERVER_IP, B_SERVER_PORT))
-        send_role_handshake(b_sock, ROLE_A)
+        send_cipher, recv_cipher = send_role_handshake(b_sock, ROLE_A)
         b_sock.settimeout(None)
         log(f"[A-{worker_id}] connected_to_b(multi) {B_SERVER_IP}:{B_SERVER_PORT}")
 
-        framed = FramedConn(b_sock, name=f"A-{worker_id}<->B")
+        framed = FramedConn(
+            b_sock, name=f"A-{worker_id}<->B",
+            send_cipher=send_cipher, recv_cipher=recv_cipher,
+        )
         b_sock = None
         log(f"[A-{worker_id}] 已挂载(多流模式)，等待 C 接入...")
 

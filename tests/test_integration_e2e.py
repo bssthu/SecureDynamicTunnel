@@ -20,6 +20,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
+# ?? conftest ???? PSK?????? -c "config.SHARED_KEY=..." ??????
+from tests.conftest import TEST_SHARED_KEY as _TEST_SHARED_KEY  # noqa: E402
+
 
 def _free_port():
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -95,6 +98,8 @@ def _spawn_with_overrides(module_name, overrides):
     over_src = "\n".join(f"config.{k} = {v!r}" for k, v in overrides.items())
     code = textwrap.dedent(f"""
         import sys, runpy, config
+        # ?????? SHARED_KEY???????? crypto.validate_shared_key ???
+        config.SHARED_KEY = {_TEST_SHARED_KEY!r}
 {textwrap.indent(over_src, '        ')}
         runpy.run_module({module_name!r}, run_name='__main__')
     """)

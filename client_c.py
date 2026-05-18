@@ -52,7 +52,7 @@ def _close_active_socks():
 
 
 def connect_to_b():
-    """尝试连接并认证到 B。失败按配置重试，全部失败返回 None。"""
+    """尝试连接并认证到 B。成功返回 (sock, send_cipher, recv_cipher)；全部失败返回 None。"""
     last_err = None
     attempt = 0
     while not _shutdown_event.is_set():
@@ -63,11 +63,11 @@ def connect_to_b():
             b_sock.settimeout(C_CONNECT_TIMEOUT)
             b_sock.connect((B_SERVER_IP, B_SERVER_PORT))
 
-            # 握手认证（裸字节，与帧协议无关）
-            send_role_handshake(b_sock, ROLE_C)
+            # 安全握手：X25519 ECDH + HMAC(SHARED_KEY)，派生 AEAD 会话密钥。
+            send_cipher, recv_cipher = send_role_handshake(b_sock, ROLE_C)
 
             b_sock.settimeout(None)
-            return b_sock
+            return b_sock, send_cipher, recv_cipher
         except Exception as e:
             last_err = e
             _untrack_sock(b_sock)
@@ -92,14 +92,18 @@ def bridge_handler(c_user_conn):
         peer = ("?", 0)
     log(f"[C#{cid}] user_connected from={peer}")
     _track_sock(c_user_conn)
-    b_sock = connect_to_b()
-    if b_sock is None:
+    result = connect_to_b()
+    if result is None:
         log(f"[C#{cid}] no_b_connection, closing")
         _untrack_sock(c_user_conn)
         safe_close_sock(c_user_conn)
         return
+    b_sock, send_cipher, recv_cipher = result
 
-    framed = FramedConn(b_sock, name=f"C#{cid}<->B")
+    framed = FramedConn(
+        b_sock, name=f"C#{cid}<->B",
+        send_cipher=send_cipher, recv_cipher=recv_cipher,
+    )
     try:
         # 认证后的第一个包必须进入帧协议；先发一个 PING 作为协议标记帧。
         framed.send(FRAME_PING)

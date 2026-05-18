@@ -30,6 +30,7 @@ from config import (
     HEARTBEAT_TIMEOUT,
     RECV_POLL,
 )
+from crypto import TAG_LEN
 from log_utils import log
 
 FRAME_DATA = 0x01
@@ -68,30 +69,51 @@ def safe_close_sock(sock):
 
 
 class FramedConn:
-    """对一个已建立的 TCP socket 做帧化封装。线程安全的发送 + 最近收包时间戳。"""
+    """对一个已建立的 TCP socket 做帧化封装。线程安全的发送 + 最近收包时间戳。
 
-    def __init__(self, sock, name=""):
+    若提供 send_cipher / recv_cipher（来自 crypto.FrameCipher），则每帧 payload
+    会被 ChaCha20-Poly1305 AEAD 加密：
+        wire  = type(1) || ciphertext_len(4) || ciphertext
+        AAD   = type(1) || ciphertext_len(4)
+        nonce = 由 cipher 内部 seq 单调派生（双方同步前进）
+    任何篡改 / 重放 / 乱序都会让 tag 校验失败并触发 FrameError。
+    cipher 为 None 时退化为原始明文帧（仅供测试 / 兼容旧路径）。
+    """
+
+    def __init__(self, sock, name="", send_cipher=None, recv_cipher=None):
         self.sock = sock
         self.name = name
         self._send_lock = threading.Lock()
         self._closed = False
         self.last_recv = time.time()
-        # 持久接收缓冲：跨多次 recv_frame 调用保留未消费完的字节，
-        # 避免 socket 超时中断中间丢弃部分帧头/载荷。
         self._rx_buf = bytearray()
+        self._send_cipher = send_cipher
+        self._recv_cipher = recv_cipher
+        self._encrypted = send_cipher is not None and recv_cipher is not None
 
     @property
     def closed(self):
         return self._closed
+
+    @property
+    def encrypted(self):
+        return self._encrypted
 
     def send(self, ftype, payload=b""):
         if self._closed:
             raise FrameError(f"{self.name} 已关闭")
         if len(payload) > MAX_PAYLOAD:
             raise FrameError("payload 超过最大长度")
-        header = _HDR.pack(ftype, len(payload))
+        if self._encrypted:
+            # 先按明文长度算出 ciphertext 长度，预先打 header 作为 AAD
+            wire_len = len(payload) + TAG_LEN
+            header = _HDR.pack(ftype, wire_len)
+            body = self._send_cipher.encrypt(header, payload)
+        else:
+            header = _HDR.pack(ftype, len(payload))
+            body = payload
         with self._send_lock:
-            self.sock.sendall(header + payload)
+            self.sock.sendall(header + body)
 
     def _fill_until(self, target_len):
         """读取直到 _rx_buf 至少有 target_len 字节。
@@ -109,13 +131,25 @@ class FramedConn:
         ftype, length = _HDR.unpack_from(self._rx_buf, 0)
         if ftype not in _VALID_FRAME_TYPES:
             raise FrameError(f"非法帧类型: {ftype}")
-        if length > MAX_PAYLOAD:
+        # 加密模式下 length 表示密文长度（明文 + TAG）
+        max_wire = MAX_PAYLOAD + (TAG_LEN if self._encrypted else 0)
+        if length > max_wire:
             raise FrameError(f"非法 payload 长度: {length}")
         total = HEADER_LEN + length
         if length:
             self._fill_until(total)
-        payload = bytes(self._rx_buf[HEADER_LEN:total])
+        body = bytes(self._rx_buf[HEADER_LEN:total])
         del self._rx_buf[:total]
+        if self._encrypted:
+            if length < TAG_LEN:
+                raise FrameError("密文长度不足")
+            aad = _HDR.pack(ftype, length)
+            try:
+                payload = self._recv_cipher.decrypt(aad, body)
+            except Exception as e:  # InvalidTag 等
+                raise FrameError(f"帧解密失败: {e}")
+        else:
+            payload = body
         return ftype, payload
 
     def take_buffered(self):
@@ -126,14 +160,21 @@ class FramedConn:
     def close(self):
         if self._closed:
             return
-        self._closed = True
-        # 尽力发一个 CLOSE 帧，让对端能立即感知
+        # 尽力发一个 CLOSE 帧（加密模式下会自动走 AEAD），让对端能立即感知。
+        # 注意先发再设 closed，避免 send() 检测到关闭状态而拒发。
         try:
-            header = _HDR.pack(FRAME_CLOSE, 0)
-            with self._send_lock:
-                self.sock.sendall(header)
+            if self._encrypted:
+                header = _HDR.pack(FRAME_CLOSE, TAG_LEN)
+                body = self._send_cipher.encrypt(header, b"")
+                with self._send_lock:
+                    self.sock.sendall(header + body)
+            else:
+                header = _HDR.pack(FRAME_CLOSE, 0)
+                with self._send_lock:
+                    self.sock.sendall(header)
         except Exception:
             pass
+        self._closed = True
         safe_close_sock(self.sock)
 
 
