@@ -28,6 +28,8 @@ from config import (
     HEARTBEAT_ENABLED,
     HEARTBEAT_INTERVAL,
     HEARTBEAT_TIMEOUT,
+    MULTI_STREAM_PENDING_LIMIT,
+    RECV_CHUNK_SIZE,
     RECV_POLL,
 )
 from crypto import TAG_LEN
@@ -104,15 +106,16 @@ class FramedConn:
             raise FrameError(f"{self.name} 已关闭")
         if len(payload) > MAX_PAYLOAD:
             raise FrameError("payload 超过最大长度")
-        if self._encrypted:
-            # 先按明文长度算出 ciphertext 长度，预先打 header 作为 AAD
-            wire_len = len(payload) + TAG_LEN
-            header = _HDR.pack(ftype, wire_len)
-            body = self._send_cipher.encrypt(header, payload)
-        else:
-            header = _HDR.pack(ftype, len(payload))
-            body = payload
         with self._send_lock:
+            if self._encrypted:
+                # The AEAD sequence advances during encrypt(), so encryption and
+                # socket write must be serialized together.
+                wire_len = len(payload) + TAG_LEN
+                header = _HDR.pack(ftype, wire_len)
+                body = self._send_cipher.encrypt(header, payload)
+            else:
+                header = _HDR.pack(ftype, len(payload))
+                body = payload
             self.sock.sendall(header + body)
 
     def _fill_until(self, target_len):
@@ -163,14 +166,13 @@ class FramedConn:
         # 尽力发一个 CLOSE 帧（加密模式下会自动走 AEAD），让对端能立即感知。
         # 注意先发再设 closed，避免 send() 检测到关闭状态而拒发。
         try:
-            if self._encrypted:
-                header = _HDR.pack(FRAME_CLOSE, TAG_LEN)
-                body = self._send_cipher.encrypt(header, b"")
-                with self._send_lock:
+            with self._send_lock:
+                if self._encrypted:
+                    header = _HDR.pack(FRAME_CLOSE, TAG_LEN)
+                    body = self._send_cipher.encrypt(header, b"")
                     self.sock.sendall(header + body)
-            else:
-                header = _HDR.pack(FRAME_CLOSE, 0)
-                with self._send_lock:
+                else:
+                    header = _HDR.pack(FRAME_CLOSE, 0)
                     self.sock.sendall(header)
         except Exception:
             pass
@@ -271,7 +273,7 @@ def run_endpoint(framed, raw_sock, role_label=""):
     def raw_to_frame():
         try:
             while not stop.is_set():
-                data = raw_sock.recv(8192)
+                data = raw_sock.recv(RECV_CHUNK_SIZE)
                 if not data:
                     break
                 framed.send(FRAME_DATA, data)
@@ -436,7 +438,7 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
                     pending = b""
                 else:
                     try:
-                        data = c_sock.recv(8192)
+                        data = c_sock.recv(RECV_CHUNK_SIZE)
                     except socket.timeout:
                         continue
                     if not data:
@@ -578,106 +580,195 @@ def run_bridge(framed_a, framed_c):
 # ---------------------------------------------------------------------------
 
 def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, role_label="A"):
-    """
-    A 端多流循环：保持与 B 的单条长连接，通过 PAIR/DATA/STREAM_CLOSE 帧
-    处理多个并发 C 会话，每个会话在独立线程中与本地服务双向转发。
-
-    framed            : 已与 B 完成握手的 FramedConn
-    local_service_addr: (host, port) 本地服务地址
-    connect_timeout   : 连接本地服务的超时秒数
-    """
+    """A-side multi-stream endpoint with bounded pending buffers and stream stats."""
     stop = threading.Event()
-    # streams: stream_id -> dict(sock, pending, ready_event, closed)
-    # 主循环收到 PAIR 时同步登记 entry（sock=None），然后异步去 connect 本地服务；
-    # 期间到达的 DATA 暂存到 pending，connect 成功后回放，避免数据丢失。
     streams = {}
     streams_lock = threading.Lock()
+    endpoint_state = {"close_reason": "endpoint_stopped", "exception_type": ""}
 
     framed.sock.settimeout(RECV_POLL)
 
-    def _close_stream(sid, reason=""):
+    def _new_stream_entry():
+        return {
+            "sock": None,
+            "pending": [],
+            "pending_bytes": 0,
+            "closed": False,
+            "started_at": time.monotonic(),
+            "c_to_a_bytes": 0,
+            "a_to_local_bytes": 0,
+            "local_to_a_bytes": 0,
+            "close_reason": "",
+            "exception_type": "",
+            "lock": threading.Lock(),
+        }
+
+    def _add_bytes(entry, key, size):
+        with entry["lock"]:
+            entry[key] += size
+
+    def _mark_closed(entry, reason="", exception_type=""):
+        with entry["lock"]:
+            entry["closed"] = True
+            if reason and not entry["close_reason"]:
+                entry["close_reason"] = reason
+            if exception_type and not entry["exception_type"]:
+                entry["exception_type"] = exception_type
+            return entry["sock"]
+
+    def _log_stream_closed(sid, entry):
+        with entry["lock"]:
+            duration_ms = int((time.monotonic() - entry["started_at"]) * 1000)
+            close_reason = entry["close_reason"] or "closed"
+            exception_type = entry["exception_type"] or ""
+            c_to_a_bytes = entry["c_to_a_bytes"]
+            a_to_local_bytes = entry["a_to_local_bytes"]
+            local_to_a_bytes = entry["local_to_a_bytes"]
+            pending_bytes = entry["pending_bytes"]
+        log(
+            f"[{role_label}] stream_closed stream_id={sid} "
+            f"close_reason={close_reason} exception_type={exception_type} "
+            f"duration_ms={duration_ms} c_to_a_bytes={c_to_a_bytes} "
+            f"a_to_local_bytes={a_to_local_bytes} "
+            f"local_to_a_bytes={local_to_a_bytes} "
+            f"pending_bytes={pending_bytes} "
+            f"pending_limit_bytes={MULTI_STREAM_PENDING_LIMIT}"
+        )
+
+    def _close_stream(sid, reason="", exception_type="", notify_b=False):
         with streams_lock:
             entry = streams.pop(sid, None)
             if entry is None:
                 return
-            entry["closed"] = True
-            sock = entry["sock"]
-        if reason:
-            log(f"[{role_label}] stream {sid} 关闭: {reason}")
+            sock = _mark_closed(entry, reason=reason, exception_type=exception_type)
+        if notify_b:
+            try:
+                framed.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
+            except Exception as e:
+                with entry["lock"]:
+                    if not entry["exception_type"]:
+                        entry["exception_type"] = type(e).__name__
+                    if not entry["close_reason"]:
+                        entry["close_reason"] = "notify_b_failed"
         if sock is not None:
             safe_close_sock(sock)
+        _log_stream_closed(sid, entry)
 
-    def _local_to_framed(sid, local_sock):
-        """本地服务 → B（DATA 帧，前 2B 为 stream_id）"""
+    def _close_all_streams(reason, exception_type=""):
+        with streams_lock:
+            items = list(streams.items())
+            streams.clear()
+            socks = [
+                _mark_closed(entry, reason=reason, exception_type=exception_type)
+                for _, entry in items
+            ]
+        for sock in socks:
+            if sock is not None:
+                safe_close_sock(sock)
+        for sid, entry in items:
+            _log_stream_closed(sid, entry)
+
+    def _local_to_framed(sid, entry, local_sock):
         prefix = STREAM_ID_STRUCT.pack(sid)
+        close_reason = "local_eof"
+        exception_type = ""
         try:
             while not stop.is_set():
                 try:
-                    data = local_sock.recv(8192)
-                except Exception:
+                    data = local_sock.recv(RECV_CHUNK_SIZE)
+                except Exception as e:
+                    close_reason = "local_recv_error"
+                    exception_type = type(e).__name__
                     break
                 if not data:
+                    close_reason = "local_eof"
                     break
                 try:
                     framed.send(FRAME_DATA, prefix + data)
-                except Exception:
+                    _add_bytes(entry, "local_to_a_bytes", len(data))
+                except Exception as e:
+                    close_reason = "send_to_b_failed"
+                    exception_type = type(e).__name__
                     break
         finally:
-            try:
-                framed.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
-            except Exception:
-                pass
-            _close_stream(sid)
+            if stop.is_set() and close_reason == "local_eof":
+                close_reason = endpoint_state["close_reason"]
+                exception_type = endpoint_state["exception_type"]
+            _close_stream(
+                sid,
+                reason=close_reason,
+                exception_type=exception_type,
+                notify_b=True,
+            )
 
-    def _start_stream(sid):
-        """异步：连接本地服务，连成功后把 pending 缓冲回放进去并发 PAIR_ACK。"""
+    def _start_stream(sid, entry):
         local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         local_sock.settimeout(connect_timeout)
         try:
             local_sock.connect(local_service_addr)
         except Exception as e:
-            log(f"[{role_label}] stream {sid} 连接本地服务失败: {e}")
+            log(f"[{role_label}] stream {sid} local_connect_failed: {e}")
             safe_close_sock(local_sock)
-            with streams_lock:
-                streams.pop(sid, None)
-            try:
-                framed.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
-            except Exception:
-                pass
+            _close_stream(
+                sid,
+                reason="local_connect_failed",
+                exception_type=type(e).__name__,
+                notify_b=True,
+            )
             return
         local_sock.settimeout(None)
 
         with streams_lock:
-            entry = streams.get(sid)
-            if entry is None or entry["closed"]:
-                safe_close_sock(local_sock)
-                return
-            buffered = entry["pending"]
-            entry["pending"] = []
-            entry["sock"] = local_sock
+            active = streams.get(sid) is entry
+            if active:
+                with entry["lock"]:
+                    buffered = entry["pending"]
+                    entry["pending"] = []
+                    entry["pending_bytes"] = 0
+                    entry["sock"] = local_sock
+            else:
+                buffered = None
+        if not active:
+            safe_close_sock(local_sock)
+            return
 
-        # 回放缓冲（已脱离锁，避免阻塞主循环登记 / 关闭）
         try:
             for chunk in buffered:
                 local_sock.sendall(chunk)
+                _add_bytes(entry, "a_to_local_bytes", len(chunk))
         except Exception as e:
-            log(f"[{role_label}] stream {sid} 回放缓冲失败: {e}")
-            _close_stream(sid)
+            log(f"[{role_label}] stream {sid} pending_replay_failed: {e}")
+            _close_stream(
+                sid,
+                reason="pending_replay_failed",
+                exception_type=type(e).__name__,
+                notify_b=True,
+            )
             return
 
         try:
             framed.send(FRAME_PAIR_ACK, STREAM_ID_STRUCT.pack(sid))
         except Exception as e:
-            log(f"[{role_label}] stream {sid} PAIR_ACK 发送失败: {e}")
-            _close_stream(sid)
+            log(f"[{role_label}] stream {sid} pair_ack_failed: {e}")
+            _close_stream(
+                sid,
+                reason="pair_ack_failed",
+                exception_type=type(e).__name__,
+                notify_b=False,
+            )
             return
-        log(f"[{role_label}] stream {sid} 已建立本地连接 {local_service_addr}")
-        threading.Thread(target=_local_to_framed, args=(sid, local_sock), daemon=True).start()
+        log(f"[{role_label}] stream {sid} local_connected {local_service_addr}")
+        threading.Thread(
+            target=_local_to_framed,
+            args=(sid, entry, local_sock),
+            daemon=True,
+        ).start()
 
     def watchdog():
         while not stop.wait(RECV_POLL):
             if time.time() - framed.last_recv > HEARTBEAT_TIMEOUT:
-                log(f"[{role_label}] 心跳超时，断开链路")
+                endpoint_state["close_reason"] = "heartbeat_timeout"
+                log(f"[{role_label}] heartbeat_timeout")
                 stop.set()
                 safe_close_sock(framed.sock)
                 return
@@ -693,27 +784,28 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
             except socket.timeout:
                 continue
             except FrameError as e:
-                log(f"[{role_label}] 帧错误: {e}")
+                endpoint_state["close_reason"] = "frame_error"
+                endpoint_state["exception_type"] = type(e).__name__
+                log(f"[{role_label}] frame_error {e}")
                 break
             except Exception as e:
                 if not stop.is_set():
-                    log(f"[{role_label}] recv 异常: {e}")
+                    endpoint_state["close_reason"] = "recv_error"
+                    endpoint_state["exception_type"] = type(e).__name__
+                    log(f"[{role_label}] recv_error {e}")
                 break
 
             if ftype == FRAME_PAIR:
                 if len(payload) < STREAM_ID_LEN:
-                    log(f"[{role_label}] PAIR 帧 payload 过短")
+                    endpoint_state["close_reason"] = "invalid_pair"
+                    log(f"[{role_label}] invalid_pair")
                     break
                 sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
-                log(f"[{role_label}] 收到 PAIR stream_id={sid}")
-                # 同步登记 entry，确保后续 DATA 不会因为 connect 还没完成而丢失
+                log(f"[{role_label}] pair_received stream_id={sid}")
                 with streams_lock:
-                    streams[sid] = {
-                        "sock": None,
-                        "pending": [],
-                        "closed": False,
-                    }
-                threading.Thread(target=_start_stream, args=(sid,), daemon=True).start()
+                    entry = _new_stream_entry()
+                    streams[sid] = entry
+                threading.Thread(target=_start_stream, args=(sid, entry), daemon=True).start()
 
             elif ftype == FRAME_DATA:
                 if len(payload) < STREAM_ID_LEN:
@@ -722,49 +814,72 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                 data = payload[STREAM_ID_LEN:]
                 if not data:
                     continue
+                entry = None
+                local_sock = None
+                overflow = False
+                pending_bytes = 0
                 with streams_lock:
                     entry = streams.get(sid)
-                    if entry is None or entry["closed"]:
-                        local_sock = None
-                    elif entry["sock"] is None:
-                        # 还在 connect，先暂存
-                        entry["pending"].append(data)
-                        local_sock = None
-                    else:
-                        local_sock = entry["sock"]
+                    if entry is not None:
+                        with entry["lock"]:
+                            if not entry["closed"]:
+                                entry["c_to_a_bytes"] += len(data)
+                                local_sock = entry["sock"]
+                                if local_sock is None:
+                                    pending_bytes = entry["pending_bytes"] + len(data)
+                                    if pending_bytes > MULTI_STREAM_PENDING_LIMIT:
+                                        overflow = True
+                                    else:
+                                        entry["pending"].append(data)
+                                        entry["pending_bytes"] = pending_bytes
+                if entry is None:
+                    continue
+                if overflow:
+                    log(
+                        f"[{role_label}] pending_limit_exceeded stream_id={sid} "
+                        f"pending_bytes={pending_bytes} "
+                        f"pending_limit_bytes={MULTI_STREAM_PENDING_LIMIT}"
+                    )
+                    _close_stream(sid, reason="pending_limit_exceeded", notify_b=True)
+                    continue
                 if local_sock is not None:
                     try:
                         local_sock.sendall(data)
-                    except Exception:
-                        _close_stream(sid, reason="本地写入失败")
+                        _add_bytes(entry, "a_to_local_bytes", len(data))
+                    except Exception as e:
+                        _close_stream(
+                            sid,
+                            reason="local_write_failed",
+                            exception_type=type(e).__name__,
+                            notify_b=True,
+                        )
 
             elif ftype == FRAME_STREAM_CLOSE:
                 if len(payload) < STREAM_ID_LEN:
                     continue
                 sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
-                _close_stream(sid, reason="B 通知关闭")
+                _close_stream(sid, reason="b_stream_close", notify_b=False)
 
             elif ftype == FRAME_PING:
                 try:
                     framed.send(FRAME_PONG)
                 except Exception:
+                    endpoint_state["close_reason"] = "send_pong_failed"
                     break
             elif ftype == FRAME_PONG:
                 pass
             elif ftype == FRAME_CLOSE:
-                log(f"[{role_label}] 收到对端 CLOSE")
+                endpoint_state["close_reason"] = "b_close"
+                log(f"[{role_label}] b_close")
                 break
             else:
-                log(f"[{role_label}] 未知帧类型: {ftype}")
+                endpoint_state["close_reason"] = "unknown_frame"
+                log(f"[{role_label}] unknown_frame ftype={ftype}")
                 break
     finally:
         stop.set()
-        with streams_lock:
-            entries = list(streams.values())
-            streams.clear()
-        for entry in entries:
-            entry["closed"] = True
-            sock = entry.get("sock")
-            if sock is not None:
-                safe_close_sock(sock)
+        _close_all_streams(
+            endpoint_state["close_reason"],
+            endpoint_state["exception_type"],
+        )
         framed.close()

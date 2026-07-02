@@ -185,10 +185,14 @@ def main():
             _remove_multi_a_locked(item, reason=reason, close=True)
 
     def _pick_multi_a_locked():
-        for item in list(multi_a):
-            if not item["framed"].closed:
-                return item
-            _remove_multi_a_locked(item, reason="连接已关闭", close=False)
+        for _ in range(len(multi_a)):
+            item = multi_a.popleft()
+            if item["framed"].closed:
+                log(f"[!] remove_closed_multi_a a_id={item['id']} {_stats_locked()}")
+                continue
+            multi_a.append(item)
+            return item
+        waiting_cond.notify_all()
         return None
 
     def _claim_multi_a(deadline):
@@ -246,22 +250,71 @@ def main():
 
     # ---- 多流 A 处理 ----
 
-    def _close_stream_on_a(a_item, sid, notify_a=True):
+    def _new_b_stream_stats():
+        return {
+            "started_at": time.monotonic(),
+            "c_to_a_bytes": 0,
+            "a_to_c_bytes": 0,
+            "close_reason": "",
+            "exception_type": "",
+        }
+
+    def _set_b_stream_close_reason_locked(a_item, sid, reason="", exception_type=""):
+        stats = a_item["stream_stats"].get(sid)
+        if stats is None:
+            return
+        if reason and not stats["close_reason"]:
+            stats["close_reason"] = reason
+        if exception_type and not stats["exception_type"]:
+            stats["exception_type"] = exception_type
+
+    def _add_b_stream_bytes(a_item, sid, key, size):
+        with a_item["streams_lock"]:
+            stats = a_item["stream_stats"].get(sid)
+            if stats is not None:
+                stats[key] += size
+
+    def _log_b_stream_closed(a_item, sid, stats):
+        duration_ms = int((time.monotonic() - stats["started_at"]) * 1000)
+        log(
+            f"[B] multi_stream_closed a_id={a_item['id']} stream_id={sid} "
+            f"close_reason={stats['close_reason'] or 'closed'} "
+            f"exception_type={stats['exception_type'] or ''} "
+            f"duration_ms={duration_ms} "
+            f"c_to_a_bytes={stats['c_to_a_bytes']} "
+            f"a_to_c_bytes={stats['a_to_c_bytes']} "
+            f"{_stats_locked()}"
+        )
+
+    def _close_stream_on_a(a_item, sid, notify_a=True, reason="", exception_type=""):
         with a_item["streams_lock"]:
             framed_c = a_item["streams"].pop(sid, None)
+            _set_b_stream_close_reason_locked(
+                a_item,
+                sid,
+                reason=reason,
+                exception_type=exception_type,
+            )
         if framed_c is not None:
             framed_c.close()
         if notify_a:
             try:
                 a_item["framed"].send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
-            except Exception:
-                pass
+            except Exception as e:
+                with a_item["streams_lock"]:
+                    _set_b_stream_close_reason_locked(
+                        a_item,
+                        sid,
+                        reason="notify_a_failed",
+                        exception_type=type(e).__name__,
+                    )
 
     def _handle_role_a_multi(framed, a_id):
         item = {
             "id": a_id,
             "framed": framed,
             "streams": {},
+            "stream_stats": {},
             "streams_lock": threading.Lock(),
             "next_stream_id": count(1),
             "stop": threading.Event(),
@@ -316,13 +369,25 @@ def main():
                     if framed_c is not None and data:
                         try:
                             framed_c.send(FRAME_DATA, data)
-                        except Exception:
-                            _close_stream_on_a(item, sid, notify_a=True)
+                            _add_b_stream_bytes(item, sid, "a_to_c_bytes", len(data))
+                        except Exception as e:
+                            _close_stream_on_a(
+                                item,
+                                sid,
+                                notify_a=True,
+                                reason="send_to_c_failed",
+                                exception_type=type(e).__name__,
+                            )
                 elif ftype == FRAME_STREAM_CLOSE:
                     if len(payload) >= STREAM_ID_LEN:
                         sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
                         log(f"[B] 多流 A#{a_id} 通知关闭 stream_id={sid}")
-                        _close_stream_on_a(item, sid, notify_a=False)
+                        _close_stream_on_a(
+                            item,
+                            sid,
+                            notify_a=False,
+                            reason="a_stream_close",
+                        )
                 elif ftype == FRAME_PING:
                     try:
                         framed.send(FRAME_PONG)
@@ -339,6 +404,12 @@ def main():
         finally:
             stop.set()
             with item["streams_lock"]:
+                for sid in item["streams"]:
+                    _set_b_stream_close_reason_locked(
+                        item,
+                        sid,
+                        reason="a_connection_closed",
+                    )
                 c_conns = list(item["streams"].values())
                 item["streams"].clear()
             for fc in c_conns:
@@ -393,8 +464,10 @@ def main():
             return
 
         sid = next(a_item["next_stream_id"])
+        stats = _new_b_stream_stats()
         with a_item["streams_lock"]:
             a_item["streams"][sid] = framed_c
+            a_item["stream_stats"][sid] = stats
 
         framed_a = a_item["framed"]
         a_id = a_item["id"]
@@ -405,7 +478,11 @@ def main():
             log(f"[B] 多流 A#{a_id} 发送 PAIR 失败: {e}")
             with a_item["streams_lock"]:
                 a_item["streams"].pop(sid, None)
+                stats = a_item["stream_stats"].pop(sid, stats)
+                stats["close_reason"] = "send_pair_failed"
+                stats["exception_type"] = type(e).__name__
             framed_c.close()
+            _log_b_stream_closed(a_item, sid, stats)
             return
 
         log(f"[B] 多流 A#{a_id} 分配 stream_id={sid} {_stats_locked()}")
@@ -413,43 +490,64 @@ def main():
         framed_c.sock.settimeout(RECV_POLL)
         prefix = STREAM_ID_STRUCT.pack(sid)
         c_to_a_bytes = 0
+        close_reason = "c_loop_exit"
+        exception_type = ""
         try:
             while True:
                 try:
                     ftype, payload = framed_c.recv_frame()
                 except socket.timeout:
                     if time.time() - framed_c.last_recv > HEARTBEAT_TIMEOUT:
+                        close_reason = "c_heartbeat_timeout"
                         log(f"[B] C stream_id={sid} 心跳超时")
                         break
                     continue
                 except Exception as e:
+                    close_reason = "c_recv_error"
+                    exception_type = type(e).__name__
                     log(f"[B] C stream_id={sid} recv 异常: {e}")
                     break
                 if ftype == FRAME_DATA:
                     try:
                         framed_a.send(FRAME_DATA, prefix + payload)
                         c_to_a_bytes += len(payload)
-                    except Exception:
+                        _add_b_stream_bytes(a_item, sid, "c_to_a_bytes", len(payload))
+                    except Exception as e:
+                        close_reason = "send_to_a_failed"
+                        exception_type = type(e).__name__
                         break
                 elif ftype == FRAME_PING:
                     try:
                         framed_c.send(FRAME_PONG)
-                    except Exception:
+                    except Exception as e:
+                        close_reason = "send_pong_failed"
+                        exception_type = type(e).__name__
                         break
                 elif ftype == FRAME_PONG:
                     pass
                 elif ftype == FRAME_CLOSE:
+                    close_reason = "c_close"
                     break
                 else:
+                    close_reason = "unexpected_c_frame"
                     break
         finally:
             try:
                 framed_a.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
-            except Exception:
-                pass
+            except Exception as e:
+                if close_reason == "c_loop_exit":
+                    close_reason = "notify_a_failed"
+                if not exception_type:
+                    exception_type = type(e).__name__
             with a_item["streams_lock"]:
                 a_item["streams"].pop(sid, None)
+                stats = a_item["stream_stats"].pop(sid, stats)
+                if not stats["close_reason"]:
+                    stats["close_reason"] = close_reason
+                if exception_type and not stats["exception_type"]:
+                    stats["exception_type"] = exception_type
             framed_c.close()
+            _log_b_stream_closed(a_item, sid, stats)
             log(
                 f"[B] 多流 stream_id={sid} 已关闭 c_to_a_bytes={c_to_a_bytes} "
                 f"{_stats_locked()}"

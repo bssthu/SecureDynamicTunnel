@@ -143,7 +143,7 @@ def connect_loop(worker_id=1):
 
 def main():
     _shutdown_event.clear()
-    worker_count = 1 if A_MULTI_STREAM else max(1, int(A_WORKERS))
+    worker_count = max(1, int(A_WORKERS))
     threads = []
     log(
         f"[*] A 客户端启动，file={__file__} "

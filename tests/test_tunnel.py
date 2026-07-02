@@ -10,6 +10,7 @@ import pytest
 import framing
 import server_b
 import client_c
+import client_a
 from framing import (
     FRAME_CLOSE, FRAME_DATA, FRAME_PING, FRAME_PONG,
     FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE,
@@ -33,6 +34,7 @@ def _quiet_background_logs():
     server_b.log = lambda *_args, **_kwargs: None
     framing.log = lambda *_args, **_kwargs: None
     client_c.log = lambda *_args, **_kwargs: None
+    client_a.log = lambda *_args, **_kwargs: None
 
 
 def _free_port():
@@ -72,6 +74,21 @@ def _send_frame(target, ftype, payload=b""):
         target.send(ftype, payload)
         return
     target.sendall(_HDR.pack(ftype, len(payload)) + payload)
+
+
+def test_client_a_multi_stream_uses_configured_workers(monkeypatch):
+    started = []
+
+    def fake_connect_loop(worker_id):
+        started.append(worker_id)
+
+    monkeypatch.setattr(client_a, "A_MULTI_STREAM", True)
+    monkeypatch.setattr(client_a, "A_WORKERS", 4)
+    monkeypatch.setattr(client_a, "connect_loop", fake_connect_loop)
+
+    client_a.main()
+
+    assert sorted(started) == [1, 2, 3, 4]
 
 
 class _RoleSock:
@@ -508,13 +525,16 @@ def test_multi_multiple_c_share_one_a(b_server_multi):
         _send_frame(c2, FRAME_DATA, b"data-from-c2")
 
         # A 收到两个 DATA，stream_id 不同
-        ftype, payload = _recv_frame(a_sock)
-        assert ftype == FRAME_DATA
-        assert payload[STREAM_ID_LEN:] == b"data-from-c1"
-
-        ftype, payload = _recv_frame(a_sock)
-        assert ftype == FRAME_DATA
-        assert payload[STREAM_ID_LEN:] == b"data-from-c2"
+        received = {}
+        for _ in range(2):
+            ftype, payload = _recv_frame(a_sock)
+            assert ftype == FRAME_DATA
+            sid = STREAM_ID_STRUCT.unpack(payload[:STREAM_ID_LEN])[0]
+            received[sid] = payload[STREAM_ID_LEN:]
+        assert received == {
+            sid1: b"data-from-c1",
+            sid2: b"data-from-c2",
+        }
 
         c1.close()
         c2.close()
@@ -1158,5 +1178,3 @@ def test_e2e_real_client_c_multi_user_close_propagates(b_server_multi, monkeypat
         a_sock.close()
         client_c._shutdown_event.set()
         c_thread.join(timeout=3)
-
-
