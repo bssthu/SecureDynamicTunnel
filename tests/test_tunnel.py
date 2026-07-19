@@ -11,8 +11,9 @@ import framing
 import server_b
 import client_c
 import client_a
+from e2e import E2EClientHandshake, E2EError, accept_client_hello
 from framing import (
-    FRAME_CLOSE, FRAME_DATA, FRAME_PING, FRAME_PONG,
+    FRAME_CLOSE, FRAME_DATA, FRAME_ERROR, FRAME_PING, FRAME_PONG,
     FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE,
     STREAM_ID_STRUCT, STREAM_ID_LEN,
     HEADER_LEN, MAX_PAYLOAD,
@@ -74,6 +75,48 @@ def _send_frame(target, ftype, payload=b""):
         target.send(ftype, payload)
         return
     target.sendall(_HDR.pack(ftype, len(payload)) + payload)
+
+
+def _complete_fake_a_e2e(a_sock, sid):
+    """Finish the real client_c handshake from a test-controlled A socket."""
+    ftype, payload = _recv_frame(a_sock)
+    assert ftype == FRAME_DATA
+    assert STREAM_ID_STRUCT.unpack(payload[:STREAM_ID_LEN])[0] == sid
+    server_hello, a_channel = accept_client_hello(payload[STREAM_ID_LEN:])
+    _send_frame(
+        a_sock,
+        FRAME_DATA,
+        STREAM_ID_STRUCT.pack(sid) + server_hello,
+    )
+    _send_frame(a_sock, FRAME_PAIR_ACK, STREAM_ID_STRUCT.pack(sid))
+    return a_channel
+
+
+def test_e2e_channel_round_trip_and_tamper_rejection():
+    client_handshake = E2EClientHandshake()
+    server_hello, a_channel = accept_client_hello(client_handshake.initial_packet)
+    c_channel = client_handshake.finish(server_hello)
+
+    packet = c_channel.seal(b"secret-from-c")
+    assert b"secret-from-c" not in packet
+    assert a_channel.open(packet) == b"secret-from-c"
+
+    response = a_channel.seal(b"secret-from-a")
+    assert c_channel.open(response) == b"secret-from-a"
+
+    tampered = bytearray(c_channel.seal(b"tamper-me"))
+    tampered[-1] ^= 1
+    with pytest.raises(E2EError):
+        a_channel.open(bytes(tampered))
+
+
+def test_e2e_handshake_rejects_different_key():
+    client_handshake = E2EClientHandshake(psk=b"client-key-0123456789abcdef")
+    with pytest.raises(E2EError):
+        accept_client_hello(
+            client_handshake.initial_packet,
+            psk=b"server-key-0123456789abcdef",
+        )
 
 
 def test_client_a_multi_stream_uses_configured_workers(monkeypatch):
@@ -297,7 +340,7 @@ def test_c_gets_http_503_frame_when_no_a_is_available(b_server):
     c_sock = _connect_role(b_server, ROLE_C)
     try:
         ftype, payload = _recv_frame(c_sock)
-        assert ftype == FRAME_DATA
+        assert ftype == FRAME_ERROR
         assert b"HTTP/1.1 503 Service Unavailable" in payload
         assert b"no available tunnel peer A" in payload
     finally:
@@ -357,7 +400,7 @@ def test_multi_c_gets_503_when_no_a(b_server_multi):
     c_sock = _connect_role(b_server_multi, ROLE_C)
     try:
         ftype, payload = _recv_frame(c_sock)
-        assert ftype == FRAME_DATA
+        assert ftype == FRAME_ERROR
         assert b"503" in payload
     finally:
         c_sock.close()
@@ -807,7 +850,7 @@ def test_framed_conn_send_after_close_raises():
 # ---- run_multi_stream_a_endpoint 单元测试 ----
 
 def test_multi_stream_a_endpoint_pair_flow():
-    """A 端多流端点：收到 PAIR 后回复 PAIR_ACK"""
+    """A 端多流端点：端到端握手后本地连接失败并关闭 stream。"""
     a_sock, peer = socket.socketpair()
     try:
         framed = FramedConn(a_sock, name="A-test")
@@ -822,13 +865,17 @@ def test_multi_stream_a_endpoint_pair_flow():
 
         # 模拟 B 发 PAIR
         _send_frame(peer, FRAME_PAIR, STREAM_ID_STRUCT.pack(42))
+        client_handshake = E2EClientHandshake()
+        _send_frame(
+            peer,
+            FRAME_DATA,
+            STREAM_ID_STRUCT.pack(42) + client_handshake.initial_packet,
+        )
 
-        # A 应该回复 PAIR_ACK（或 STREAM_CLOSE，因为连不上本地服务）
+        # 本地服务连不上，A 不会确认端到端握手，而是关闭该 stream。
         ftype, payload = _recv_frame(peer)
-        # 本地服务连不上，所以收到 STREAM_CLOSE
-        assert ftype in (FRAME_PAIR_ACK, FRAME_STREAM_CLOSE)
-        if ftype == FRAME_STREAM_CLOSE:
-            assert STREAM_ID_STRUCT.unpack(payload)[0] == 42
+        assert ftype == FRAME_STREAM_CLOSE
+        assert STREAM_ID_STRUCT.unpack(payload)[0] == 42
 
         framed.close()
         t.join(timeout=2)
@@ -868,8 +915,18 @@ def test_multi_stream_a_endpoint_data_routing():
     t.start()
 
     try:
-        # 让 A endpoint 收到 PAIR → 连接本地服务 → 回 PAIR_ACK
+        # 让 A endpoint 收到 PAIR 和 C hello，完成端到端握手并连接本地服务。
         _send_frame(peer, FRAME_PAIR, STREAM_ID_STRUCT.pack(7))
+        client_handshake = E2EClientHandshake()
+        _send_frame(
+            peer,
+            FRAME_DATA,
+            STREAM_ID_STRUCT.pack(7) + client_handshake.initial_packet,
+        )
+        ftype, payload = _recv_frame(peer)
+        assert ftype == FRAME_DATA, f"got {ftype:#x}"
+        assert STREAM_ID_STRUCT.unpack_from(payload)[0] == 7
+        c_channel = client_handshake.finish(payload[STREAM_ID_LEN:])
         ftype, payload = _recv_frame(peer)
         assert ftype == FRAME_PAIR_ACK, f"got {ftype:#x}"
         assert STREAM_ID_STRUCT.unpack(payload)[0] == 7
@@ -880,7 +937,11 @@ def test_multi_stream_a_endpoint_data_routing():
         local_conn.settimeout(2)
 
         # B → A：DATA 带 stream_id，应被转发到本地服务
-        _send_frame(peer, FRAME_DATA, STREAM_ID_STRUCT.pack(7) + b"ping-local")
+        _send_frame(
+            peer,
+            FRAME_DATA,
+            STREAM_ID_STRUCT.pack(7) + c_channel.seal(b"ping-local"),
+        )
         got = _recv_exact(local_conn, len(b"ping-local"))
         assert got == b"ping-local"
 
@@ -889,7 +950,7 @@ def test_multi_stream_a_endpoint_data_routing():
         ftype, payload = _recv_frame(peer)
         assert ftype == FRAME_DATA
         assert STREAM_ID_STRUCT.unpack(payload[:STREAM_ID_LEN])[0] == 7
-        assert payload[STREAM_ID_LEN:] == b"pong-back"
+        assert c_channel.open(payload[STREAM_ID_LEN:]) == b"pong-back"
 
         local_conn.close()
     finally:
@@ -980,7 +1041,7 @@ def test_multi_c_wait_timeout_when_no_a(b_server_multi, monkeypatch):
     c_sock = _connect_role(b_server_multi, ROLE_C)
     try:
         ftype, payload = _recv_frame(c_sock)
-        assert ftype == FRAME_DATA
+        assert ftype == FRAME_ERROR
         assert b"503" in payload
     finally:
         c_sock.close()
@@ -1081,6 +1142,27 @@ def _start_real_c_bridge(b_port, monkeypatch):
     return user_side, t
 
 
+def test_e2e_real_client_c_forwards_no_a_error(b_server_multi, monkeypatch):
+    """B 的外层 ERROR 可在端到端握手前作为 503 转交本地用户。"""
+    user_side, c_thread = _start_real_c_bridge(b_server_multi, monkeypatch)
+    try:
+        user_side.settimeout(3)
+        response = bytearray()
+        while True:
+            chunk = user_side.recv(4096)
+            if not chunk:
+                break
+            response.extend(chunk)
+        assert b"HTTP/1.1 503 Service Unavailable" in response
+    finally:
+        try:
+            user_side.close()
+        except Exception:
+            pass
+        client_c._shutdown_event.set()
+        c_thread.join(timeout=3)
+
+
 def test_e2e_real_client_c_multi_round_trip(b_server_multi, monkeypatch):
     """真实跑 client_c._bridge_handler_multi 与 B 通信，验证 A→C→用户、用户→C→A 双向数据。
     这条用例能捕获 _HDR_UNPACK 这种"只在 A 真正回数据时才暴露"的 bug。"""
@@ -1093,9 +1175,14 @@ def test_e2e_real_client_c_multi_round_trip(b_server_multi, monkeypatch):
         assert ftype == FRAME_PAIR, f"expected PAIR, got {ftype:#x}"
         sid = STREAM_ID_STRUCT.unpack(payload)[0]
 
-        # 模拟 A 完成本地连接：回 PAIR_ACK 后向 C 推送数据
-        _send_frame(a_sock, FRAME_PAIR_ACK, STREAM_ID_STRUCT.pack(sid))
-        _send_frame(a_sock, FRAME_DATA, STREAM_ID_STRUCT.pack(sid) + b"HTTP/1.1 200 OK\r\n\r\nbody")
+        # 模拟 A 完成端到端握手后向 C 推送加密数据。
+        a_channel = _complete_fake_a_e2e(a_sock, sid)
+        _send_frame(
+            a_sock,
+            FRAME_DATA,
+            STREAM_ID_STRUCT.pack(sid)
+            + a_channel.seal(b"HTTP/1.1 200 OK\r\n\r\nbody"),
+        )
 
         # 用户侧应能 recv 到原始字节（client_c 已剥掉帧头）
         user_side.settimeout(3)
@@ -1107,7 +1194,7 @@ def test_e2e_real_client_c_multi_round_trip(b_server_multi, monkeypatch):
         ftype, payload = _recv_frame(a_sock)
         assert ftype == FRAME_DATA
         assert STREAM_ID_STRUCT.unpack(payload[:STREAM_ID_LEN])[0] == sid
-        assert payload[STREAM_ID_LEN:] == b"GET / HTTP/1.1\r\n\r\n"
+        assert a_channel.open(payload[STREAM_ID_LEN:]) == b"GET / HTTP/1.1\r\n\r\n"
     finally:
         try:
             user_side.close()
@@ -1124,19 +1211,25 @@ def test_e2e_real_client_c_multi_handles_ping_from_b(b_server_multi, monkeypatch
     user_side, c_thread = _start_real_c_bridge(b_server_multi, monkeypatch)
     try:
         a_sock.settimeout(3)
-        ftype, _ = _recv_frame(a_sock)
+        ftype, payload = _recv_frame(a_sock)
         assert ftype == FRAME_PAIR
+        sid = STREAM_ID_STRUCT.unpack(payload)[0]
+        a_channel = _complete_fake_a_e2e(a_sock, sid)
 
         # client_c 起步时也会发 PING 给 B；B 会回 PONG。
         # 这里我们关心的是 client_c b_to_user 线程能正常解析任意帧而不崩溃。
         # 通过让 A 发一段小数据触发 client_c 的解帧路径：
-        ftype_payload = STREAM_ID_STRUCT.pack(1) + b"x"
+        ftype_payload = STREAM_ID_STRUCT.pack(sid) + a_channel.seal(b"x")
         _send_frame(a_sock, FRAME_DATA, ftype_payload)
         user_side.settimeout(3)
         assert _recv_exact(user_side, 1) == b"x"
 
         # 再发第二帧验证 b_to_user 线程仍存活（之前 unpack 崩溃后这一步会超时）
-        _send_frame(a_sock, FRAME_DATA, STREAM_ID_STRUCT.pack(1) + b"y")
+        _send_frame(
+            a_sock,
+            FRAME_DATA,
+            STREAM_ID_STRUCT.pack(sid) + a_channel.seal(b"y"),
+        )
         assert _recv_exact(user_side, 1) == b"y"
     finally:
         try:
@@ -1157,7 +1250,7 @@ def test_e2e_real_client_c_multi_user_close_propagates(b_server_multi, monkeypat
         ftype, payload = _recv_frame(a_sock)
         assert ftype == FRAME_PAIR
         sid = STREAM_ID_STRUCT.unpack(payload)[0]
-        _send_frame(a_sock, FRAME_PAIR_ACK, STREAM_ID_STRUCT.pack(sid))
+        _complete_fake_a_e2e(a_sock, sid)
 
         # 用户侧关闭 → client_c 的 user_to_b 退出 → framed.close() → B 感知 → A 收到 STREAM_CLOSE
         user_side.close()

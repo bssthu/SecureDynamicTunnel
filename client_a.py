@@ -19,6 +19,7 @@ from framing import (
     safe_close_sock,
     FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
 )
+from e2e import accept_client_hello
 from log_utils import log
 from tunnel_common import ROLE_A, send_role_handshake
 
@@ -66,8 +67,9 @@ def _one_round_single(worker_id=1):
         )
         b_sock = None
         log(f"[A-{worker_id}] 已挂载，等待 C 接入...")
-        first_payload = _wait_first_data(framed)
-        log(f"[A-{worker_id}] paired first_payload_bytes={len(first_payload)}")
+        client_hello = _wait_first_data(framed)
+        server_hello, e2e_channel = accept_client_hello(client_hello)
+        log(f"[A-{worker_id}] paired e2e_client_hello_bytes={len(client_hello)}")
 
         local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         local_sock.settimeout(A_CONNECT_TIMEOUT)
@@ -78,9 +80,14 @@ def _one_round_single(worker_id=1):
             raise
         local_sock.settimeout(None)
         log(f"[A-{worker_id}] local_service_connected {LOCAL_SERVICE_ADDR}")
-        local_sock.sendall(first_payload)
+        framed.send(FRAME_DATA, server_hello)
 
-        run_endpoint(framed, local_sock, role_label=f"A-{worker_id}")
+        run_endpoint(
+            framed,
+            local_sock,
+            role_label=f"A-{worker_id}",
+            data_channel=e2e_channel,
+        )
         log(f"[A-{worker_id}] session_closed")
         framed = None
         local_sock = None

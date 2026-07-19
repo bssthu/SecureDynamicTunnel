@@ -20,7 +20,7 @@ from config import (
 )
 from framing import (
     FramedConn, run_bridge, safe_close_sock, waiting_keepalive,
-    FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
+    FRAME_DATA, FRAME_ERROR, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
     FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE,
     STREAM_ID_STRUCT, STREAM_ID_LEN,
     _heartbeat_loop,
@@ -83,9 +83,9 @@ def _start_bridge(framed_a, framed_c, a_id):
 
 
 def _send_no_a_response(framed_c):
-    """通过 C 侧帧协议返回 HTTP 503，避免上游只看到 EOF。"""
+    """通过外层 ERROR 帧返回 HTTP 503，不冒充 A↔C 端到端业务数据。"""
     try:
-        framed_c.send(FRAME_DATA, NO_A_HTTP_RESPONSE)
+        framed_c.send(FRAME_ERROR, NO_A_HTTP_RESPONSE)
     except Exception as e:
         log(f"[!] 发送 no-A HTTP 503 失败: {e}")
     finally:

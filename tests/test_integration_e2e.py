@@ -20,8 +20,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# ?? conftest ???? PSK?????? -c "config.SHARED_KEY=..." ??????
-from tests.conftest import TEST_SHARED_KEY as _TEST_SHARED_KEY  # noqa: E402
+from tests.conftest import (  # noqa: E402
+    TEST_A_C_E2E_KEY as _TEST_A_C_E2E_KEY,
+    TEST_B_AUTH_KEY as _TEST_B_AUTH_KEY,
+)
 
 
 def _free_port():
@@ -97,9 +99,14 @@ def _spawn_with_overrides(module_name, overrides):
     ç”¨ -c "import config; config.X=...; runpy.run_module(...)" å®žçŽ°ã€‚"""
     over_src = "\n".join(f"config.{k} = {v!r}" for k, v in overrides.items())
     code = textwrap.dedent(f"""
-        import sys, runpy, config
-        # ?????? SHARED_KEY???????? crypto.validate_shared_key ???
-        config.SHARED_KEY = {_TEST_SHARED_KEY!r}
+        import importlib.util, pathlib, runpy, sys
+        config_path = pathlib.Path({str(ROOT / 'config_example.py')!r})
+        spec = importlib.util.spec_from_file_location("config", config_path)
+        config = importlib.util.module_from_spec(spec)
+        sys.modules["config"] = config
+        spec.loader.exec_module(config)
+        config.B_AUTH_KEY = {_TEST_B_AUTH_KEY!r}
+        config.A_C_E2E_KEY = {_TEST_A_C_E2E_KEY!r}
 {textwrap.indent(over_src, '        ')}
         runpy.run_module({module_name!r}, run_name='__main__')
     """)
@@ -313,7 +320,7 @@ def test_full_stack_concurrent_clients_multi_stream():
 
 
 
-# ---- Ä£ÄâÓÃ»§³¡¾°£ºÁ¬ÉÏµ«¾Ã²»·¢Êý¾Ý / ¶à´ÎË³ÐòÇëÇó / ·þÎñ¶ËÖ÷¶¯¹Ø ----
+# ---- User scenarios: idle connections, sequential requests, server close ----
 
 class _SlowEcho:
     def __init__(self):

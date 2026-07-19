@@ -1,18 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-SDT v2 安全层：
-- 启动期校验 SHARED_KEY 强度（最小长度 & 不允许示例默认值）。
-- 三端握手：X25519 ECDH 派生临时会话密钥 + HMAC-SHA256(SHARED_KEY) 双向认证。
+SDT 外层链路安全层：
+- 启动期校验 B_AUTH_KEY 强度（最小长度 & 不允许示例默认值）。
+- A/C↔B 握手：X25519 ECDH 派生临时会话密钥 + HMAC-SHA256(B_AUTH_KEY) 双向认证。
 - 数据帧加密：ChaCha20-Poly1305 AEAD，nonce 由单调 seq 派生，天然防重放/防乱序。
 
 威胁模型回应：
 - 旁路抓包：业务流量全部 AEAD 加密，仅能看到帧头(类型+长度)。
-- 中间人：因 ECDH 公钥用 PSK 做 HMAC 绑定，攻击者无 SHARED_KEY 无法伪造握手，
+- 中间人：因 ECDH 公钥用 PSK 做 HMAC 绑定，攻击者无 B_AUTH_KEY 无法伪造握手，
   也无法替换公钥而不被察觉，故无法接管会话。
 - 重放：握手两端各发 16B 随机 nonce 并参与密钥派生；数据帧 seq 决定 nonce，
   重放/重排会导致 AEAD tag 校验失败。
-- 弱口令离线爆破：HMAC 用 PSK 仅在握手阶段使用一次，无法降低协议强度；
-  但仍要求 PSK 长度 >= MIN_SHARED_KEY_LEN，且禁用示例默认值。
+- 预共享密钥必须使用高熵随机值；长度校验和占位值黑名单只能阻止部分误配置。
 """
 
 import hmac
@@ -27,11 +26,11 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from config import SHARED_KEY
+from config import B_AUTH_KEY
 
 # ---------- 常量 ----------
 
-MIN_SHARED_KEY_LEN = 16
+MIN_B_AUTH_KEY_LEN = 16
 _FORBIDDEN_DEFAULT_KEYS = {
     "Your_Super_Strong_Random_Secret_Key_2026",
     "",
@@ -56,29 +55,33 @@ _HKDF_S2C_INFO = b"sdt-v2 s2c"
 _MAX_SEQ = 1 << 63
 
 
-class SharedKeyError(RuntimeError):
-    """SHARED_KEY 不符合强度要求时抛出。"""
+class BAuthKeyError(RuntimeError):
+    """B_AUTH_KEY 不符合要求时抛出。"""
 
 
-def validate_shared_key():
-    """启动期调用：不通过则直接抛 SharedKeyError 让进程退出。"""
-    if not isinstance(SHARED_KEY, str):
-        raise SharedKeyError("SHARED_KEY 必须是字符串")
-    if SHARED_KEY in _FORBIDDEN_DEFAULT_KEYS:
-        raise SharedKeyError(
-            "SHARED_KEY 仍为示例/占位默认值，请改为强随机字符串后再启动。"
-            f" 当前最小长度要求 {MIN_SHARED_KEY_LEN} 字符。"
+# 保留旧异常名，避免仅捕获该异常的调用方在升级时失效。
+SharedKeyError = BAuthKeyError
+
+
+def validate_b_auth_key():
+    """启动期调用：不通过则直接抛 BAuthKeyError 让进程退出。"""
+    if not isinstance(B_AUTH_KEY, str):
+        raise BAuthKeyError("B_AUTH_KEY 必须是字符串")
+    if B_AUTH_KEY in _FORBIDDEN_DEFAULT_KEYS:
+        raise BAuthKeyError(
+            "B_AUTH_KEY 仍为示例/占位默认值，请改为强随机字符串后再启动。"
+            f" 当前最小长度要求 {MIN_B_AUTH_KEY_LEN} 字符。"
         )
-    if len(SHARED_KEY) < MIN_SHARED_KEY_LEN:
-        raise SharedKeyError(
-            f"SHARED_KEY 长度必须 ≥ {MIN_SHARED_KEY_LEN} 字符 "
-            f"(当前 {len(SHARED_KEY)})。请使用 ≥32 字符的高熵随机字符串。"
+    if len(B_AUTH_KEY) < MIN_B_AUTH_KEY_LEN:
+        raise BAuthKeyError(
+            f"B_AUTH_KEY 长度必须 ≥ {MIN_B_AUTH_KEY_LEN} 字符 "
+            f"(当前 {len(B_AUTH_KEY)})。请使用 ≥32 字符的高熵随机字符串。"
         )
 
 
 # 模块导入时立即校验；测试用 conftest 会在导入前注入合规 key。
-validate_shared_key()
-_PSK = SHARED_KEY.encode("utf-8")
+validate_b_auth_key()
+_PSK = B_AUTH_KEY.encode("utf-8")
 
 
 # ---------- 内部工具 ----------

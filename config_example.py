@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 
-# Shared authentication key. Keep this identical on A, B, and C.
-# 必须满足：长度 >= 16 字符，且不能是示例占位值。建议使用 >= 32 字符的高熵随机串，
-# 例如：python -c "import secrets;print(secrets.token_urlsafe(32))"
-# 启动时若不合规会直接抛 SharedKeyError 终止进程。
-SHARED_KEY = ""
+# Outer-link authentication key. Keep this identical on A, B, and C.
+# 用于保护 A↔B、C↔B 链路；必须是 >= 16 字符的高熵随机串。
+B_AUTH_KEY = ""
+
+# End-to-end business-data key. Keep this identical on A and C only.
+# 不要把该密钥部署到 B；B 的 config.py 中可保持为空。
+# 建议为两个密钥分别执行：python -c "import secrets;print(secrets.token_urlsafe(32))"
+A_C_E2E_KEY = ""
 
 # B server listen config.
 B_LISTEN_HOST = "0.0.0.0"
@@ -33,6 +36,7 @@ C_CONNECT_TIMEOUT = 5
 C_RECONNECT_INTERVAL = 2
 C_RECONNECT_MAX_RETRIES = 0
 C_ACCEPT_POLL = 0.5
+E2E_HANDSHAKE_TIMEOUT = 10
 
 # B pairing behavior.
 C_WAIT_TIMEOUT = 10

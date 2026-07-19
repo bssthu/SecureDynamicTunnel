@@ -15,6 +15,7 @@
     0x05 PAIR         B→A 通知有新 C 接入（payload: 2B stream_id）
     0x06 PAIR_ACK     A→B 确认已建立本地连接（payload: 2B stream_id）
     0x07 STREAM_CLOSE 通知对端关闭某个 stream（payload: 2B stream_id）
+    0x08 ERROR        B→C 的外层错误（例如无可用 A；不属于端到端业务数据）
 """
 
 import socket
@@ -42,8 +43,10 @@ FRAME_CLOSE = 0x04
 FRAME_PAIR = 0x05
 FRAME_PAIR_ACK = 0x06
 FRAME_STREAM_CLOSE = 0x07
+FRAME_ERROR = 0x08
 _VALID_FRAME_TYPES = {FRAME_DATA, FRAME_PING, FRAME_PONG, FRAME_CLOSE,
-                      FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE}
+                      FRAME_PAIR, FRAME_PAIR_ACK, FRAME_STREAM_CLOSE,
+                      FRAME_ERROR}
 
 STREAM_ID_STRUCT = struct.Struct("!H")
 STREAM_ID_LEN = STREAM_ID_STRUCT.size
@@ -259,10 +262,13 @@ def waiting_keepalive(framed, promote_event, label=""):
     return True
 
 
-def run_endpoint(framed, raw_sock, role_label=""):
+def run_endpoint(framed, raw_sock, role_label="", data_channel=None):
     """
     A / C 端的双向转发循环：
         framed (帧侧，对 B) <-> raw_sock (本地裸字节侧)
+
+    data_channel 非 None 时，FRAME_DATA payload 会在发送前端到端加密、接收后
+    端到端解密；B 只能转发密文。
 
     自带：发送 PING 心跳、读 PONG/PING 处理、看门狗。
     阻塞直到任一侧关闭或心跳超时。返回时两侧 socket 均已关闭。
@@ -276,7 +282,8 @@ def run_endpoint(framed, raw_sock, role_label=""):
                 data = raw_sock.recv(RECV_CHUNK_SIZE)
                 if not data:
                     break
-                framed.send(FRAME_DATA, data)
+                payload = data_channel.seal(data) if data_channel is not None else data
+                framed.send(FRAME_DATA, payload)
                 counters["raw_to_frame"] += len(data)
         except Exception:
             pass
@@ -315,9 +322,12 @@ def run_endpoint(framed, raw_sock, role_label=""):
 
             if ftype == FRAME_DATA:
                 try:
-                    raw_sock.sendall(payload)
-                    counters["frame_to_raw"] += len(payload)
-                except Exception:
+                    data = data_channel.open(payload) if data_channel is not None else payload
+                    raw_sock.sendall(data)
+                    counters["frame_to_raw"] += len(data)
+                except Exception as e:
+                    if not stop.is_set():
+                        log(f"[{role_label}] 端到端数据处理失败: {e}")
                     break
             elif ftype == FRAME_PING:
                 try:
@@ -581,6 +591,9 @@ def run_bridge(framed_a, framed_c):
 
 def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, role_label="A"):
     """A-side multi-stream endpoint with bounded pending buffers and stream stats."""
+    # Lazy import keeps A_C_E2E_KEY entirely out of the B process.
+    from e2e import accept_client_hello
+
     stop = threading.Event()
     streams = {}
     streams_lock = threading.Lock()
@@ -591,6 +604,8 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
     def _new_stream_entry():
         return {
             "sock": None,
+            "channel": None,
+            "handshake_started": False,
             "pending": [],
             "pending_bytes": 0,
             "closed": False,
@@ -684,7 +699,11 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                     close_reason = "local_eof"
                     break
                 try:
-                    framed.send(FRAME_DATA, prefix + data)
+                    with entry["lock"]:
+                        channel = entry["channel"]
+                    if channel is None:
+                        raise FrameError("端到端通道尚未建立")
+                    framed.send(FRAME_DATA, prefix + channel.seal(data))
                     _add_bytes(entry, "local_to_a_bytes", len(data))
                 except Exception as e:
                     close_reason = "send_to_b_failed"
@@ -701,7 +720,7 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                 notify_b=True,
             )
 
-    def _start_stream(sid, entry):
+    def _start_stream(sid, entry, server_hello):
         local_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         local_sock.settimeout(connect_timeout)
         try:
@@ -730,6 +749,19 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                 buffered = None
         if not active:
             safe_close_sock(local_sock)
+            return
+
+        prefix = STREAM_ID_STRUCT.pack(sid)
+        try:
+            framed.send(FRAME_DATA, prefix + server_hello)
+        except Exception as e:
+            log(f"[{role_label}] stream {sid} e2e_server_hello_failed: {e}")
+            _close_stream(
+                sid,
+                reason="e2e_server_hello_failed",
+                exception_type=type(e).__name__,
+                notify_b=True,
+            )
             return
 
         try:
@@ -805,22 +837,76 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                 with streams_lock:
                     entry = _new_stream_entry()
                     streams[sid] = entry
-                threading.Thread(target=_start_stream, args=(sid, entry), daemon=True).start()
 
             elif ftype == FRAME_DATA:
                 if len(payload) < STREAM_ID_LEN:
                     continue
                 sid = STREAM_ID_STRUCT.unpack_from(payload)[0]
-                data = payload[STREAM_ID_LEN:]
-                if not data:
+                packet = payload[STREAM_ID_LEN:]
+                if not packet:
                     continue
                 entry = None
                 local_sock = None
+                channel = None
+                handshake_started = False
                 overflow = False
                 pending_bytes = 0
                 with streams_lock:
                     entry = streams.get(sid)
                     if entry is not None:
+                        with entry["lock"]:
+                            if not entry["closed"]:
+                                channel = entry["channel"]
+                                handshake_started = entry["handshake_started"]
+                if entry is None:
+                    continue
+
+                if channel is None:
+                    if handshake_started:
+                        _close_stream(
+                            sid,
+                            reason="duplicate_e2e_client_hello",
+                            notify_b=True,
+                        )
+                        continue
+                    try:
+                        server_hello, channel = accept_client_hello(packet)
+                    except Exception as e:
+                        log(f"[{role_label}] stream {sid} e2e_handshake_failed: {e}")
+                        _close_stream(
+                            sid,
+                            reason="e2e_handshake_failed",
+                            exception_type=type(e).__name__,
+                            notify_b=True,
+                        )
+                        continue
+                    with entry["lock"]:
+                        if entry["closed"]:
+                            continue
+                        entry["handshake_started"] = True
+                        entry["channel"] = channel
+                    threading.Thread(
+                        target=_start_stream,
+                        args=(sid, entry, server_hello),
+                        daemon=True,
+                    ).start()
+                    continue
+
+                try:
+                    data = channel.open(packet)
+                except Exception as e:
+                    log(f"[{role_label}] stream {sid} e2e_data_failed: {e}")
+                    _close_stream(
+                        sid,
+                        reason="e2e_data_failed",
+                        exception_type=type(e).__name__,
+                        notify_b=True,
+                    )
+                    continue
+
+                with streams_lock:
+                    current = streams.get(sid)
+                    if current is entry:
                         with entry["lock"]:
                             if not entry["closed"]:
                                 entry["c_to_a_bytes"] += len(data)
@@ -832,8 +918,6 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
                                     else:
                                         entry["pending"].append(data)
                                         entry["pending_bytes"] = pending_bytes
-                if entry is None:
-                    continue
                 if overflow:
                     log(
                         f"[{role_label}] pending_limit_exceeded stream_id={sid} "
