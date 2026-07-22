@@ -105,21 +105,26 @@ class FramedConn:
         return self._encrypted
 
     def send(self, ftype, payload=b""):
-        if self._closed:
-            raise FrameError(f"{self.name} 已关闭")
         if len(payload) > MAX_PAYLOAD:
             raise FrameError("payload 超过最大长度")
         with self._send_lock:
-            if self._encrypted:
-                # The AEAD sequence advances during encrypt(), so encryption and
-                # socket write must be serialized together.
-                wire_len = len(payload) + TAG_LEN
-                header = _HDR.pack(ftype, wire_len)
-                body = self._send_cipher.encrypt(header, payload)
-            else:
-                header = _HDR.pack(ftype, len(payload))
-                body = payload
-            self.sock.sendall(header + body)
+            if self._closed:
+                raise FrameError(f"{self.name} 已关闭")
+            try:
+                if self._encrypted:
+                    # Encryption and socket write are one indivisible sequence
+                    # operation. A failed write makes the cipher state unusable.
+                    wire_len = len(payload) + TAG_LEN
+                    header = _HDR.pack(ftype, wire_len)
+                    body = self._send_cipher.encrypt(header, payload)
+                else:
+                    header = _HDR.pack(ftype, len(payload))
+                    body = payload
+                self.sock.sendall(header + body)
+            except Exception:
+                self._closed = True
+                safe_close_sock(self.sock)
+                raise
 
     def _fill_until(self, target_len):
         """读取直到 _rx_buf 至少有 target_len 字节。
@@ -168,8 +173,10 @@ class FramedConn:
             return
         # 尽力发一个 CLOSE 帧（加密模式下会自动走 AEAD），让对端能立即感知。
         # 注意先发再设 closed，避免 send() 检测到关闭状态而拒发。
-        try:
-            with self._send_lock:
+        with self._send_lock:
+            if self._closed:
+                return
+            try:
                 if self._encrypted:
                     header = _HDR.pack(FRAME_CLOSE, TAG_LEN)
                     body = self._send_cipher.encrypt(header, b"")
@@ -177,9 +184,12 @@ class FramedConn:
                 else:
                     header = _HDR.pack(FRAME_CLOSE, 0)
                     self.sock.sendall(header)
-        except Exception:
-            pass
-        self._closed = True
+            except Exception:
+                pass
+            finally:
+                # Set while holding the send lock so queued writers cannot
+                # append DATA after the terminal CLOSE frame.
+                self._closed = True
         safe_close_sock(self.sock)
 
 
@@ -275,31 +285,59 @@ def run_endpoint(framed, raw_sock, role_label="", data_channel=None):
     """
     stop = threading.Event()
     counters = {"raw_to_frame": 0, "frame_to_raw": 0}
+    close_state = {"reason": "", "exception_type": ""}
+    close_state_lock = threading.Lock()
+
+    def set_close_reason(reason, exc=None):
+        with close_state_lock:
+            if not close_state["reason"]:
+                close_state["reason"] = reason
+                if exc is not None:
+                    close_state["exception_type"] = type(exc).__name__
 
     def raw_to_frame():
         try:
             while not stop.is_set():
-                data = raw_sock.recv(RECV_CHUNK_SIZE)
-                if not data:
+                try:
+                    data = raw_sock.recv(RECV_CHUNK_SIZE)
+                except Exception as exc:
+                    if not stop.is_set():
+                        set_close_reason("raw_recv_error", exc)
+                        log(f"[{role_label}] raw_recv_error: {exc}")
                     break
-                payload = data_channel.seal(data) if data_channel is not None else data
-                framed.send(FRAME_DATA, payload)
-                counters["raw_to_frame"] += len(data)
-        except Exception:
-            pass
+                if not data:
+                    set_close_reason("raw_eof")
+                    break
+                try:
+                    payload = data_channel.seal(data) if data_channel is not None else data
+                    framed.send(FRAME_DATA, payload)
+                    counters["raw_to_frame"] += len(data)
+                except Exception as exc:
+                    if not stop.is_set():
+                        set_close_reason("raw_to_frame_error", exc)
+                        log(f"[{role_label}] raw_to_frame_error: {exc}")
+                    break
         finally:
             stop.set()
+            # Active data sockets are blocking. Close explicitly to wake the
+            # receive loop instead of applying RECV_POLL as a send timeout.
+            framed.close()
 
     def watchdog():
         while not stop.wait(RECV_POLL):
             if time.time() - framed.last_recv > HEARTBEAT_TIMEOUT:
+                set_close_reason("heartbeat_timeout")
                 log(f"[{role_label}] 心跳超时，断开链路")
                 stop.set()
                 # 关掉 socket 让阻塞中的 recv 立即返回
                 safe_close_sock(framed.sock)
                 return
 
-    framed.sock.settimeout(RECV_POLL)
+    # socket.settimeout() affects sendall() too. A short receive poll timeout
+    # can therefore truncate a large encrypted frame under backpressure and
+    # advance the AEAD sequence without delivering that frame. Keep active
+    # data sockets blocking; the watchdog closes the socket to wake recv.
+    framed.sock.settimeout(None)
 
     threading.Thread(target=raw_to_frame, daemon=True).start()
     if HEARTBEAT_ENABLED:
@@ -313,10 +351,13 @@ def run_endpoint(framed, raw_sock, role_label="", data_channel=None):
             except socket.timeout:
                 continue
             except FrameError as e:
-                log(f"[{role_label}] 帧错误: {e}")
+                if not stop.is_set():
+                    set_close_reason("frame_error", e)
+                    log(f"[{role_label}] 帧错误: {e}")
                 break
             except Exception as e:
                 if not stop.is_set():
+                    set_close_reason("recv_error", e)
                     log(f"[{role_label}] recv 异常: {e}")
                 break
 
@@ -327,25 +368,32 @@ def run_endpoint(framed, raw_sock, role_label="", data_channel=None):
                     counters["frame_to_raw"] += len(data)
                 except Exception as e:
                     if not stop.is_set():
+                        set_close_reason("frame_to_raw_error", e)
                         log(f"[{role_label}] 端到端数据处理失败: {e}")
                     break
             elif ftype == FRAME_PING:
                 try:
                     framed.send(FRAME_PONG)
-                except Exception:
+                except Exception as e:
+                    set_close_reason("send_pong_error", e)
                     break
             elif ftype == FRAME_PONG:
                 pass  # last_recv 已更新
             elif ftype == FRAME_CLOSE:
+                set_close_reason("peer_close")
                 log(f"[{role_label}] 收到对端 CLOSE")
                 break
             else:
+                set_close_reason("unknown_frame")
                 log(f"[{role_label}] 未知帧类型: {ftype}")
                 break
     finally:
         stop.set()
+        set_close_reason("endpoint_stopped")
         log(
             f"[{role_label}] endpoint_closed "
+            f"close_reason={close_state['reason']} "
+            f"exception_type={close_state['exception_type']} "
             f"raw_to_frame_bytes={counters['raw_to_frame']} "
             f"frame_to_raw_bytes={counters['frame_to_raw']}"
         )
@@ -391,8 +439,10 @@ def _run_raw_c_bridge(framed_a, framed_c, first_payload):
     """
     stop = threading.Event()
     c_sock = framed_c.sock
-    framed_a.sock.settimeout(RECV_POLL)
-    c_sock.settimeout(RECV_POLL)
+    # Active bridge sockets must stay blocking so RECV_POLL never becomes a
+    # sendall timeout while forwarding a large payload.
+    framed_a.sock.settimeout(None)
+    c_sock.settimeout(None)
 
     def watchdog_a():
         while not stop.wait(RECV_POLL):
@@ -488,8 +538,10 @@ def run_bridge(framed_a, framed_c):
     默认拒绝握手后的裸流；ALLOW_RAW_C_COMPAT=True 时才兼容旧版 C 裸流。
     """
     stop = threading.Event()
-    framed_a.sock.settimeout(RECV_POLL)
-    framed_c.sock.settimeout(RECV_POLL)
+    # Watchdogs interrupt blocking recv by closing sockets. Do not put the
+    # receive poll timeout on sockets that are also used for large sends.
+    framed_a.sock.settimeout(None)
+    framed_c.sock.settimeout(None)
 
     try:
         c_mode, first_payload = _recv_first_c_item(framed_c)
@@ -599,7 +651,9 @@ def run_multi_stream_a_endpoint(framed, local_service_addr, connect_timeout, rol
     streams_lock = threading.Lock()
     endpoint_state = {"close_reason": "endpoint_stopped", "exception_type": ""}
 
-    framed.sock.settimeout(RECV_POLL)
+    # Multiple stream workers send through this socket. Keep those sends
+    # blocking; the watchdog closes the socket when the peer is truly stale.
+    framed.sock.settimeout(None)
 
     def _new_stream_entry():
         return {

@@ -330,7 +330,10 @@ def main():
             log(f"[+] A 已挂机(多流): a_id={a_id} {_stats_locked()}")
 
         stop = item["stop"]
-        framed.sock.settimeout(RECV_POLL)
+        # This socket carries large DATA sends from C handler threads. A poll
+        # timeout would also limit sendall() and can desynchronize AEAD state.
+        # The watchdog below closes the blocking socket on a real timeout.
+        framed.sock.settimeout(None)
 
         def watchdog():
             while not stop.wait(RECV_POLL):
@@ -487,11 +490,27 @@ def main():
 
         log(f"[B] 多流 A#{a_id} 分配 stream_id={sid} {_stats_locked()}")
 
-        framed_c.sock.settimeout(RECV_POLL)
+        # Keep data sends blocking. socket timeouts affect sendall() as well as
+        # recv(), which can truncate an encrypted frame under backpressure.
+        framed_c.sock.settimeout(None)
         prefix = STREAM_ID_STRUCT.pack(sid)
         c_to_a_bytes = 0
         close_reason = "c_loop_exit"
         exception_type = ""
+        c_stop = threading.Event()
+        c_timed_out = threading.Event()
+
+        def c_watchdog():
+            while not c_stop.wait(RECV_POLL):
+                if time.time() - framed_c.last_recv > HEARTBEAT_TIMEOUT:
+                    c_timed_out.set()
+                    log(f"[B] C stream_id={sid} 心跳超时")
+                    safe_close_sock(framed_c.sock)
+                    return
+
+        if HEARTBEAT_ENABLED:
+            threading.Thread(target=c_watchdog, daemon=True).start()
+
         try:
             while True:
                 try:
@@ -503,9 +522,12 @@ def main():
                         break
                     continue
                 except Exception as e:
-                    close_reason = "c_recv_error"
-                    exception_type = type(e).__name__
-                    log(f"[B] C stream_id={sid} recv 异常: {e}")
+                    if c_timed_out.is_set():
+                        close_reason = "c_heartbeat_timeout"
+                    else:
+                        close_reason = "c_recv_error"
+                        exception_type = type(e).__name__
+                        log(f"[B] C stream_id={sid} recv 异常: {e}")
                     break
                 if ftype == FRAME_DATA:
                     try:
@@ -532,6 +554,7 @@ def main():
                     close_reason = "unexpected_c_frame"
                     break
         finally:
+            c_stop.set()
             try:
                 framed_a.send(FRAME_STREAM_CLOSE, STREAM_ID_STRUCT.pack(sid))
             except Exception as e:

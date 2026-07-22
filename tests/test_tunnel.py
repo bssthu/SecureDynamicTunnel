@@ -119,6 +119,87 @@ def test_e2e_handshake_rejects_different_key():
         )
 
 
+def test_run_endpoint_survives_send_backpressure_longer_than_recv_poll(monkeypatch):
+    """A slow tunnel peer must not turn RECV_POLL into a data-send timeout."""
+    endpoint_sock, peer_sock = socket.socketpair()
+    raw_sock, user_sock = socket.socketpair()
+    endpoint_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+    payload = b"B" * (4 * 1024 * 1024)
+    sender_error = []
+
+    monkeypatch.setattr(framing, "HEARTBEAT_ENABLED", False)
+    endpoint = FramedConn(endpoint_sock, name="backpressure-endpoint")
+    peer = FramedConn(peer_sock, name="backpressure-peer")
+    endpoint_thread = threading.Thread(
+        target=framing.run_endpoint,
+        args=(endpoint, raw_sock),
+        kwargs={"role_label": "backpressure-test"},
+        daemon=True,
+    )
+
+    def send_payload():
+        try:
+            user_sock.sendall(payload)
+        except Exception as exc:
+            sender_error.append(exc)
+
+    sender_thread = threading.Thread(target=send_payload, daemon=True)
+    try:
+        endpoint_thread.start()
+        sender_thread.start()
+
+        # Deliberately exceed RECV_POLL while the framed sender is backpressured.
+        time.sleep(framing.RECV_POLL + 0.5)
+
+        peer_sock.settimeout(5)
+        received = bytearray()
+        while len(received) < len(payload):
+            ftype, chunk = peer.recv_frame()
+            if ftype == FRAME_DATA:
+                received.extend(chunk)
+            elif ftype == FRAME_CLOSE:
+                break
+
+        assert bytes(received) == payload
+        assert not sender_error
+
+        peer.send(FRAME_CLOSE)
+        endpoint_thread.join(timeout=3)
+        assert not endpoint_thread.is_alive()
+    finally:
+        for sock in (user_sock, raw_sock, peer_sock, endpoint_sock):
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def test_framed_send_failure_is_terminal_and_close_does_not_send_again():
+    class FailingSocket:
+        def __init__(self):
+            self.send_calls = 0
+
+        def sendall(self, _data):
+            self.send_calls += 1
+            raise socket.timeout("simulated send timeout")
+
+        def shutdown(self, _how):
+            pass
+
+        def close(self):
+            pass
+
+    sock = FailingSocket()
+    framed = FramedConn(sock, name="failed-send")
+
+    with pytest.raises(socket.timeout):
+        framed.send(FRAME_DATA, b"payload")
+
+    assert framed.closed
+    framed.close()
+    assert sock.send_calls == 1
+
+
 def test_client_a_multi_stream_uses_configured_workers(monkeypatch):
     started = []
 
